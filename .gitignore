@@ -1,0 +1,12 @@
+# виртуальное окружение
+.venv/
+__pycache__/
+*.pyc
+
+# чувствительные файлы
+.env
+oils.json
+orders.json
+
+# локальные настройки vscode
+.vscode/
