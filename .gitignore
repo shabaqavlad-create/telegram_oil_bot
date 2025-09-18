@@ -12,4 +12,4 @@ orders.json
 .vscode/
 
 #пояснялки
-*.txt
+requirements-dev.txt
