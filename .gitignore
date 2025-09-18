@@ -10,3 +10,6 @@ orders.json
 
 # локальные настройки vscode
 .vscode/
+
+#пояснялки
+*.txt
