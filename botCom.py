@@ -304,7 +304,7 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
         "📞 Наши контакты:\n\n"
-        "Телефон: +7 (999) 559-39-17, +7 (953) 046-36-54\n"
+        "Телефон: +7 (999) 559-39-17 - Андрей, +7 (953) 046-36-54 - Влад\n"
         "Telegram: @shaba_v, @andrey_matveev\n"
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )

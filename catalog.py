@@ -44,6 +44,20 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_250.jpg"
     },
     4: {
+        "name": "Масло трансмиссионное FluidMatic LV MV X824 OEM",
+        "volume": "1 Л",
+        "price": 2400,
+        "currency": "₽",
+        "description": "Специальное трансмиссионное масло для гибридных автомобилей.",
+        "features": [
+            "Оптимизировано для работы с электроприводами",
+            "Сохраняет вязкость при разных условиях",
+            "Оригинальное OEM качество"
+        ],
+        "compatible": "Совместимо с трансмиссиями X824 OEM",
+        "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_259.jpg"
+    },
+    5: {
         "name": "Масло трансмиссионное Castrol D1 OEM",
         "volume": "1 Л",
         "price": 2400,
@@ -57,7 +71,7 @@ oils = {
         "compatible": "Совместимо с автомобилями, рекомендующими Castrol D1 OEM",
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_331.jpg"
     },
-    5: {
+    6: {
         "name": "Масло трансмиссионное Castrol D2 OEM",
         "volume": "1 Л",
         "price": 2400,
@@ -70,20 +84,6 @@ oils = {
         ],
         "compatible": "Применяется в авто, где указано Castrol D2 OEM",
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_034.jpg"
-    },
-    6: {
-        "name": "Масло трансмиссионное FluidMatic LV MV X824 OEM",
-        "volume": "1 Л",
-        "price": 2400,
-        "currency": "₽",
-        "description": "Специальное трансмиссионное масло для гибридных автомобилей.",
-        "features": [
-            "Оптимизировано для работы с электроприводами",
-            "Сохраняет вязкость при разных условиях",
-            "Оригинальное OEM качество"
-        ],
-        "compatible": "Совместимо с трансмиссиями X824 OEM",
-        "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_259.jpg"
     },
     7: {
         "name": "Масло трансмиссионное Castrol W2",
