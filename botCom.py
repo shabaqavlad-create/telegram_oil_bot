@@ -29,30 +29,15 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 
-if not TOKEN:
-    raise RuntimeError("Переменная окружения TOKEN не задана. Проверь файл .env")
-
+# Получаем список админов из .env
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
 
-if not ADMIN_IDS:
-    logger.warning("ADMIN_IDS пуст — /orders и уведомления админам работать не будут.")
-
 ORDERS_FILE = "orders.json"
-
-# Создаём пустой файл orders.json если его нет
-if not os.path.exists(ORDERS_FILE):
-    try:
-        with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f, ensure_ascii=False, indent=2)
-        logger.info("Создан пустой orders.json")
-    except Exception as e:
-        logger.exception("Не удалось создать orders.json: %s", e)
 
 
 # --- Функция сохранения заявок ---
 def save_order(order):
-    """Сохраняем заявку в файл orders.json с уникальным ID."""
     try:
         if os.path.exists(ORDERS_FILE):
             with open(ORDERS_FILE, "r", encoding="utf-8") as f:
@@ -64,7 +49,7 @@ def save_order(order):
         orders = []
 
     order_id = len(orders) + 1
-    order["id"] = f"#{order_id:03}"  # #001, #002 …
+    order["id"] = f"#{order_id:03}"
 
     orders.append(order)
 
@@ -83,28 +68,27 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     for admin_id in ADMIN_IDS:
         try:
             await context.bot.send_message(
-                chat_id=admin_id, text=f"⚠️ Ошибка в боте: {context.error}"
+                chat_id=admin_id,
+                text=f"⚠️ Ошибка в боте: {context.error}",
             )
         except Exception:
-            logger.debug("Не удалось отправить сообщение админу %s", admin_id)
+            logger.debug("Не удалось уведомить админа %s", admin_id)
 
 
-# --- Утилита для безопасной отправки ---
+# --- Вспомогательная безопасная отправка ---
 async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
     try:
         return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
     except Exception as e:
         logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
         try:
-            return await target.reply_text(
-                text, **{k: v for k, v in kwargs.items() if k != "parse_mode"}
-            )
+            return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
         except Exception:
             logger.exception("reply_text повторно упал")
     return None
 
 
-# --- Команда /start ---
+# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -121,21 +105,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# --- Команда /id ---
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(update.message, f"Ваш Telegram ID: {update.effective_user.id}")
 
 
-# --- Команда /cancel ---
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "ordering" in context.user_data:
         del context.user_data["ordering"]
-        await safe_reply_text(
-            update.message,
-            "Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
-        )
+        await safe_reply_text(update.message, "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.")
     else:
-        await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog.")
+        await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog чтобы открыть каталог.")
 
 
 # --- Каталог ---
@@ -152,18 +131,16 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-
         if query.message.photo:
             try:
                 await query.delete_message()
             except Exception:
-                logger.debug("Не удалось удалить фото-сообщение при возврате в каталог")
+                logger.debug("Не удалось удалить фото при возврате в каталог")
             await safe_reply_text(query.message, "Выберите масло:", reply_markup=reply_markup)
         else:
             try:
                 await query.edit_message_text("Выберите масло:", reply_markup=reply_markup)
-            except Exception as e:
-                logger.debug("edit_message_text не сработал (%s). Шлём новое сообщение.", e)
+            except Exception:
                 await safe_reply_text(query.message, "Выберите масло:", reply_markup=reply_markup)
     else:
         await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
@@ -183,8 +160,8 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         oil_id = int(data.split("_")[1])
         oil = oils[oil_id]
         text = (
-            "🛒 Вы выбрали:\n"
-            f"{oil['name']} ({oil['volume']})\n\n"
+            f"🛒 Вы выбрали:\n"
+            f"{oil['name']} ({oil['volume']}) — {oil.get('price', 'цена не указана')} {oil.get('currency', '₽')}\n\n"
             "Напишите, пожалуйста, свои контактные данные (телефон или Telegram), "
             "и я передам заявку администратору."
         )
@@ -202,6 +179,7 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = (
             f"🔹 *{oil['name']}* ({oil['volume']})\n\n"
             f"{oil['description']}\n\n"
+            f"💰 Цена: {oil.get('price', 'не указана')} {oil.get('currency', '₽')}\n\n"
             "Характеристики:\n"
             + "\n".join([f"• {f}" for f in oil["features"]])
             + f"\n\nПодходит: {oil['compatible']}"
@@ -209,13 +187,14 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")],
             [InlineKeyboardButton("🛒 Оставить заявку", callback_data=f"order_{oil_id}")],
+            [InlineKeyboardButton("📞 Связаться", url="https://t.me/shaba_v")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         try:
             await query.delete_message()
         except Exception:
-            logger.debug("Не удалось удалить старое сообщение перед показом карточки")
+            pass
 
         await query.message.reply_photo(
             photo=oil["image"],
@@ -240,13 +219,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "username": user.username,
             "oil": oil["name"],
             "volume": oil["volume"],
+            "price": oil.get("price", "—"),
+            "currency": oil.get("currency", "₽"),
             "contact": text,
         }
 
         order_id = save_order(order)
 
         await update.message.reply_text(
-            f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) принята.\n"
+            f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
+            f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
             f"Контакты: {text}"
         )
 
@@ -257,12 +239,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     text=(
                         f"📩 Новая заявка {order_id}\n\n"
                         f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
+                        f"💰 Цена: {oil.get('price', '—')} {oil.get('currency', '₽')}\n"
                         f"👤 От: {username_visible}\n"
                         f"📞 Контакты: {text}"
                     ),
                 )
             except Exception as e:
-                logger.warning(f"Ошибка при отправке админу {admin_id}: {e}")
+                logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
 
         del context.user_data["ordering"]
     else:
@@ -274,14 +257,17 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if user.id not in ADMIN_IDS:
-        await safe_reply_text(update.message, f"⛔ Нет доступа.\nВаш ID: {user.id}")
+        await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
         return
 
     try:
-        with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-            orders = json.load(f)
+        if os.path.exists(ORDERS_FILE):
+            with open(ORDERS_FILE, "r", encoding="utf-8") as f:
+                orders = json.load(f)
+        else:
+            orders = []
     except Exception as e:
-        logger.exception("Не удалось прочитать orders.json в /orders: %s", e)
+        logger.exception("Ошибка чтения orders.json: %s", e)
         orders = []
 
     if not orders:
@@ -290,10 +276,10 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📋 Список заявок:\n"]
     for order in orders[-10:]:
-        username_visible = order.get("username")
-        username_visible = f"@{username_visible}" if username_visible else f"ID:{order.get('user_id')}"
+        username_visible = order.get("username") or f"ID:{order.get('user_id')}"
         lines.append(
             f"{order.get('id', '?')} — {order['oil']} ({order['volume']})\n"
+            f"💰 Цена: {order.get('price', '—')} {order.get('currency', '₽')}\n"
             f"👤 От: {username_visible}\n"
             f"📞 Контакты: {order['contact']}\n"
         )
@@ -308,8 +294,8 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏪 О нас\n\n"
         "Мы занимаемся продажей оригинальных масел для электромобилей и гибридных автомобилей.\n"
         "🔧 Только проверенные бренды.\n\n"
-        "📍 Екатеринбург, ул. Серафимы Дерябиной, д. 18а\n"
-        "🕘 9:00 — 21:00",
+        "📍 Адрес: Екатеринбург, ул. Серафимы Дерябиной, д. 18а\n"
+        "🕘 Время работы: 9:00 — 21:00",
     )
 
 
