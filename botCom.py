@@ -130,7 +130,13 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🛒 Оставить заявку", callback_data=f"order_{oil_id}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=reply_markup)
+        await query.delete_message()  # удаляем старое сообщение с кнопкой
+        await query.message.reply_photo(
+            photo=oil["image"],
+            caption=text,
+            parse_mode="Markdown",
+            reply_markup=reply_markup
+        )
 
 
 # --- Обработка заявок (текст от пользователя) ---
@@ -142,6 +148,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "ordering" in context.user_data:
         oil_id = context.user_data["ordering"]
         oil = oils[oil_id]
+        username = f"@{user.username}" if user.username else f"ID:{user.id}"
 
         order = {
             "user_id": user.id,
@@ -151,23 +158,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "contact": text,
         }
 
-        # Сохраняем в файл
         order_id = save_order(order)
 
-        # Ответ пользователю
         await update.message.reply_text(
             f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) принята.\n"
             f"Контакты: {text}"
         )
 
-        # Отправка всем админам
         for admin_id in ADMIN_IDS:
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=f"📩 Новая заявка {order_id}:\n{order}"
+                text=(
+                    f"📩 Новая заявка {order_id}\n\n"
+                    f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
+                    f"👤 От: {username}\n"
+                    f"📞 Контакты: {text}"
+                )
             )
 
-        # Очистка состояния
         del context.user_data["ordering"]
     else:
         await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
@@ -178,15 +186,12 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает список заявок из файла orders.json (только админам)."""
     user = update.effective_user
 
-    # Проверяем права
     if user.id not in ADMIN_IDS:
         await update.message.reply_text(
-            f"⛔ У вас нет доступа к этому разделу.\n"
-            f"Ваш ID: {user.id}"
+            f"⛔ У вас нет доступа к этому разделу.\nВаш ID: {user.id}"
         )
         return
 
-    # Читаем заявки из файла
     try:
         if os.path.exists(ORDERS_FILE):
             with open(ORDERS_FILE, "r", encoding="utf-8") as f:
@@ -200,13 +205,14 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Заявок пока нет.")
         return
 
-    # Формируем список заявок (последние 10)
     text = "📋 Список заявок:\n\n"
     for order in orders[-10:]:
+        order_id = order.get("id", "❓")
+        username = order.get("username") or f"ID:{order.get('user_id')}"
         text += (
-            f"{order['id']} — {order['oil']} ({order['volume']})\n"
-            f"Контакты: {order['contact']}\n"
-            f"От: @{order['username']}\n\n"
+            f"{order_id} — {order['oil']} ({order['volume']})\n"
+            f"👤 От: {username}\n"
+            f"📞 Контакты: {order['contact']}\n\n"
         )
 
     await update.message.reply_text(text)
@@ -214,7 +220,6 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Команда /about ---
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Информация о компании."""
     text = (
         "🏪 *О нас*\n\n"
         "Мы занимаемся продажей оригинальных масел для электромобилей и гибридных автомобилей.\n"
@@ -227,14 +232,12 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- Команда /contacts ---
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Контакты для связи."""
     text = (
         "📞 *Наши контакты:*\n\n"
         "Телефон: +7 (999) 559-39-17, +7 (953) 046-36-54\n"
         "Telegram: @shaba_v, @andrey_matveev\n"
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all"
     )
-    # без parse_mode, чтобы ссылка отобразилась корректно
     await update.message.reply_text(text)
 
 
