@@ -29,11 +29,28 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 
-# Получаем список админов из .env
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
 
 ORDERS_FILE = "orders.json"
+VERSION_FILE = "VERSION"  # используем без расширения .txt
+
+
+# --- Работа с версиями ---
+def get_version():
+    try:
+        with open(VERSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "неизвестна"
+    except Exception as e:
+        logger.error("Ошибка чтения VERSION: %s", e)
+        return f"ошибка чтения ({e})"
+
+
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ver = get_version()
+    await update.message.reply_text(f"🤖 Текущая версия бота: {ver}")
 
 
 # --- Функция сохранения заявок ---
@@ -50,7 +67,6 @@ def save_order(order):
 
     order_id = len(orders) + 1
     order["id"] = f"#{order_id:03}"
-
     orders.append(order)
 
     try:
@@ -116,16 +132,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.")
     else:
         await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog чтобы открыть каталог.")
-
-
-# --- Команда /version ---
-async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        with open("version.txt", "r", encoding="utf-8") as f:
-            ver = f.read().strip()
-    except FileNotFoundError:
-        ver = "Не удалось определить версию (файл version.txt не найден)."
-    await safe_reply_text(update.message, f"🤖 Текущая версия бота:\n{ver}")
 
 
 # --- Каталог ---

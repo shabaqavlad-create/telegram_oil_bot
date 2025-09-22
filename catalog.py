@@ -18,7 +18,7 @@ oils = {
     2: {
         "name": "BYD EHSF-1, EHSF-2LV",
         "volume": "1 Л",
-        "price": 1700,
+        "price": 1990,
         "currency": "₽",
         "description": "То же масло, но в маленькой упаковке для удобной доливки.",
         "features": [
