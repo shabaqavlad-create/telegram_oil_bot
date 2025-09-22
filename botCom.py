@@ -101,6 +101,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/orders — список заявок (для админов)\n"
         "/id — показать ваш Telegram ID\n"
         "/cancel — отменить оформление заявки\n"
+        "/version — показать версию бота\n"
         "/start — показать это сообщение",
     )
 
@@ -115,6 +116,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.")
     else:
         await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog чтобы открыть каталог.")
+
+
+# --- Команда /version ---
+async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open("version.txt", "r", encoding="utf-8") as f:
+            ver = f.read().strip()
+    except FileNotFoundError:
+        ver = "Не удалось определить версию (файл version.txt не найден)."
+    await safe_reply_text(update.message, f"🤖 Текущая версия бота:\n{ver}")
 
 
 # --- Каталог ---
@@ -321,6 +332,7 @@ def main():
     app.add_handler(CommandHandler("contacts", contacts))
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("version", version))
     app.add_handler(CallbackQueryHandler(show_oil))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
