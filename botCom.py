@@ -3,10 +3,8 @@ import os
 import json
 import logging
 import sqlite3
-import shutil
-import csv
-from datetime import datetime
-
+import re
+import time
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -40,59 +38,13 @@ ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()
 # --- Пути к данным ---
 ORDERS_FILE = "orders.json"   # старый формат — на случай миграции
 DB_PATH = "orders.db"         # новый SQLite
-BACKUPS_DIR = "backups"
-EXPORTS_DIR = "exports"
 
-# ---------- ВСПОМОГАТЕЛЬНЫЕ ШТУКИ ----------
+# --- Антиспам: кулдаун на отправку заявки (в секундах) ---
+ORDER_COOLDOWN_SEC = 30
+LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней успешной заявки
 
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-def ensure_dirs():
-    os.makedirs(BACKUPS_DIR, exist_ok=True)
-    os.makedirs(EXPORTS_DIR, exist_ok=True)
-
-# ---------- РЕЗЕРВНЫЕ КОПИИ БД ----------
-
-def backup_db(keep: int = 7) -> str | None:
-    """
-    Делает копию БД в папку backups/ с таймстампом.
-    Хранит только последние `keep` копий (по времени модификации).
-    Возвращает путь к созданному файлу или None, если БД ещё нет.
-    """
-    ensure_dirs()
-    if not os.path.exists(DB_PATH):
-        logger.info("Бэкап пропущен: %s ещё не создана.", DB_PATH)
-        return None
-
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dst = os.path.join(BACKUPS_DIR, f"orders_{ts}.db")
-    try:
-        shutil.copy2(DB_PATH, dst)
-        logger.info("Сделан бэкап БД: %s", dst)
-    except Exception as e:
-        logger.exception("Не удалось сделать бэкап БД: %s", e)
-        return None
-
-    # Ротация
-    try:
-        files = sorted(
-            [os.path.join(BACKUPS_DIR, f) for f in os.listdir(BACKUPS_DIR) if f.endswith(".db")],
-            key=lambda p: os.path.getmtime(p),
-            reverse=True,
-        )
-        for f in files[keep:]:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning("Не удалось выполнить ротацию бэкапов: %s", e)
-
-    return dst
 
 # ---------- БАЗА ДАННЫХ (SQLite) ----------
-
 def init_db():
     """Создаёт таблицу orders при необходимости."""
     conn = sqlite3.connect(DB_PATH)
@@ -102,7 +54,7 @@ def init_db():
             """
             CREATE TABLE IF NOT EXISTS orders (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT DEFAULT (datetime('now')),
+                created_at TEXT    DEFAULT (datetime('now')),
                 user_id    INTEGER,
                 username   TEXT,
                 oil        TEXT,
@@ -116,6 +68,7 @@ def init_db():
         conn.commit()
     finally:
         conn.close()
+
 
 def save_order_sql(order: dict) -> str:
     """
@@ -142,10 +95,10 @@ def save_order_sql(order: dict) -> str:
         )
         conn.commit()
         row_id = c.lastrowid
-        order_code = f"#{row_id:03}"
-        return order_code
+        return f"#{row_id:03}"
     finally:
         conn.close()
+
 
 def fetch_last_orders(limit: int = 10):
     """Возвращает последние N заявок (списком кортежей)."""
@@ -165,21 +118,34 @@ def fetch_last_orders(limit: int = 10):
     finally:
         conn.close()
 
-def fetch_all_orders():
-    """Все заявки (для экспорта)."""
+
+def fetch_orders_page(page: int, page_size: int = 10):
+    """
+    Возвращает (rows, total_count) для пагинации.
+    rows — список кортежей как в fetch_last_orders (но в прямом порядке по id DESC).
+    """
+    page = max(1, page)
+    offset = (page - 1) * page_size
     conn = sqlite3.connect(DB_PATH)
     try:
         c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM orders")
+        total = c.fetchone()[0] or 0
+
         c.execute(
             """
-            SELECT id, created_at, user_id, username, oil, volume, price, currency, contact
+            SELECT id, user_id, username, oil, volume, price, currency, contact, created_at
             FROM orders
-            ORDER BY id ASC
-            """
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (page_size, offset),
         )
-        return c.fetchall()
+        rows = c.fetchall()
+        return rows, total
     finally:
         conn.close()
+
 
 def db_is_empty() -> bool:
     """Пуста ли таблица orders (или её нет)."""
@@ -194,6 +160,7 @@ def db_is_empty() -> bool:
         return count == 0
     finally:
         conn.close()
+
 
 def migrate_json_to_sql():
     """
@@ -245,38 +212,41 @@ def migrate_json_to_sql():
     finally:
         conn.close()
 
-# ---------- ЭКСПОРТ CSV (для админов) ----------
 
-def export_orders_csv() -> str | None:
+# ---------- ВАЛИДАЦИЯ КОНТАКТА ----------
+PHONE_RE = re.compile(
+    r"""^\s*
+        (?:
+            (\+?\d[\d\-\s\(\)]{8,}\d)      # международный/российский телефон
+          |
+            (@[A-Za-z0-9_]{5,})            # Telegram username
+          |
+            (https?://t\.me/[A-Za-z0-9_]+) # ссылка на t.me
+        )
+        \s*$""",
+    re.VERBOSE,
+)
+
+def validate_contact(text: str) -> tuple[bool, str | None]:
     """
-    Экспорт всех заявок в CSV (UTF-8 BOM, чтобы Excel открыл корректно).
-    Возвращает путь к файлу или None, если заявок нет.
+    Простейшая проверка контакта.
+    Возвращает (ok, normalized_or_error).
     """
-    ensure_dirs()
-    rows = fetch_all_orders()
-    if not rows:
-        return None
+    if not text:
+        return False, "Пустой контакт. Укажите телефон или Telegram."
+    m = PHONE_RE.match(text)
+    if not m:
+        return False, (
+            "Некорректные контакты. Примеры:\n"
+            "• +7 900 123-45-67\n"
+            "• @username\n"
+            "• https://t.me/username"
+        )
+    # нормализация — просто обрезаем пробелы
+    return True, text.strip()
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(EXPORTS_DIR, f"orders_{ts}.csv")
-
-    headers = ["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"]
-
-    try:
-        # UTF-8 BOM чтобы Excel не ломал кириллицу
-        with open(path, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.writer(f, delimiter=";")
-            writer.writerow(headers)
-            for row in rows:
-                writer.writerow(row)
-    except Exception as e:
-        logger.exception("Не удалось записать CSV экспорт: %s", e)
-        return None
-
-    return path
 
 # ---------- УТИЛИТЫ ОТПРАВКИ ----------
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
     for admin_id in ADMIN_IDS:
@@ -287,6 +257,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.debug("Не удалось уведомить админа %s", admin_id)
+
 
 async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
     try:
@@ -299,8 +270,8 @@ async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kw
             logger.exception("reply_text повторно упал")
     return None
 
-# ---------- КОМАНДЫ ----------
 
+# ---------- КОМАНДЫ ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -310,15 +281,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/catalog — открыть каталог\n"
         "/about — о компании\n"
         "/contacts — контакты\n"
-        "/orders — список заявок (для админов)\n"
-        "/exportcsv — экспорт заявок в CSV (админы)\n"
-        "/id — показать ваш Telegram ID\n"
+        "/orders [страница] — заявки (для админов)\n"
         "/cancel — отменить оформление заявки\n"
         "/start — показать это сообщение",
     )
 
-async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply_text(update.message, f"Ваш Telegram ID: {update.effective_user.id}")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "ordering" in context.user_data:
@@ -327,31 +294,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog чтобы открыть каталог.")
 
-# --- Экспорт CSV (только для админов)
-async def exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
-        await safe_reply_text(update.message, "⛔ Команда доступна только администраторам.")
-        return
-
-    path = export_orders_csv()
-    if not path:
-        await safe_reply_text(update.message, "📭 Экспорт невозможен — заявок пока нет.")
-        return
-
-    try:
-        with open(path, "rb") as f:
-            await update.message.reply_document(
-                document=f,
-                filename=os.path.basename(path),
-                caption="Экспорт заявок (CSV).",
-            )
-    except Exception as e:
-        logger.exception("Не удалось отправить CSV: %s", e)
-        await safe_reply_text(update.message, "⚠️ Не удалось отправить CSV-файл.")
 
 # ---------- КАТАЛОГ / КНОПКИ ----------
-
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(f"{oil['name']} ({oil['volume']})", callback_data=str(oil_id))]
@@ -365,7 +309,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer()
         except Exception:
             pass
-        if query.message.photo:
+        if getattr(query.message, "photo", None):
             try:
                 await query.delete_message()
             except Exception:
@@ -378,6 +322,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await safe_reply_text(query.message, "Выберите масло:", reply_markup=reply_markup)
     else:
         await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
+
 
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -395,7 +340,8 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛒 Вы выбрали:\n"
             f"{oil['name']} ({oil['volume']}) — {oil.get('price', 'цена не указана')} {oil.get('currency', '₽')}\n\n"
             "Напишите, пожалуйста, свои контактные данные (телефон или Telegram), "
-            "и я передам заявку администратору."
+            "и я передам заявку администратору.\n\n"
+            "Можно отменить командой /cancel"
         )
         await safe_reply_text(query.message, text)
         context.user_data["ordering"] = oil_id
@@ -408,7 +354,7 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         oil = oils[oil_id]
-        text = (
+        caption = (
             f"🔹 *{oil['name']}* ({oil['volume']})\n\n"
             f"{oil['description']}\n\n"
             f"💰 Цена: {oil.get('price', 'не указана')} {oil.get('currency', '₽')}\n\n"
@@ -430,80 +376,112 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_photo(
             photo=oil["image"],
-            caption=text,
-            parse_mode="Markdown",
+            caption=caption,
+            parse_mode="Markdown",  # caption безопасен (без пользовательского ввода)
             reply_markup=reply_markup,
         )
 
-# ---------- ОБРАБОТКА ЗАЯВОК ----------
 
+# ---------- ОБРАБОТКА ЗАЯВОК ----------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
 
-    if "ordering" in context.user_data:
-        oil_id = context.user_data["ordering"]
-        oil = oils[oil_id]
-        username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
-
-        order = {
-            "user_id": user.id,
-            "username": user.username,
-            "oil": oil["name"],
-            "volume": oil["volume"],
-            "price": oil.get("price", "—"),
-            "currency": oil.get("currency", "₽"),
-            "contact": text,
-        }
-
-        # Сохраняем в SQLite
-        order_id = save_order_sql(order)
-
-        await update.message.reply_text(
-            f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
-            f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
-            f"Контакты: {text}"
-        )
-
-        # Бэкап после новой записи
-        backup_db()
-
-        for admin_id in ADMIN_IDS:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"📩 Новая заявка {order_id}\n\n"
-                        f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
-                        f"💰 Цена: {oil.get('price', '—')} {oil.get('currency', '₽')}\n"
-                        f"👤 От: {username_visible}\n"
-                        f"📞 Контакты: {text}"
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
-
-        del context.user_data["ordering"]
-    else:
+    if "ordering" not in context.user_data:
         await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
+        return
 
-# ---------- /orders (только админы) ----------
+    # 1) Валидация контакта
+    ok, norm = validate_contact(text)
+    if not ok:
+        await update.message.reply_text(norm)  # норм здесь — текст ошибки
+        return
+    contact = norm
 
+    # 2) Антиспам: проверяем кулдаун (по последней УСПЕШНОЙ заявке)
+    now = time.time()
+    last = LAST_ORDER_AT.get(user.id)
+    if last is not None:
+        remain = ORDER_COOLDOWN_SEC - int(now - last)
+        if remain > 0:
+            await update.message.reply_text(
+                f"⏳ Слишком часто. Повторите через {remain} сек."
+            )
+            return
+
+    # 3) Сохраняем заявку
+    oil_id = context.user_data["ordering"]
+    oil = oils[oil_id]
+    username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
+
+    order = {
+        "user_id": user.id,
+        "username": user.username,
+        "oil": oil["name"],
+        "volume": oil["volume"],
+        "price": oil.get("price", "—"),
+        "currency": oil.get("currency", "₽"),
+        "contact": contact,
+    }
+
+    order_id = save_order_sql(order)
+
+    await update.message.reply_text(
+        f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
+        f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
+        f"Контакты: {contact}"
+    )
+
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"📩 Новая заявка {order_id}\n\n"
+                    f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
+                    f"💰 Цена: {oil.get('price', '—')} {oil.get('currency', '₽')}\n"
+                    f"👤 От: {username_visible}\n"
+                    f"📞 Контакты: {contact}"
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
+
+    # Обновляем кулдаун только после успеха
+    LAST_ORDER_AT[user.id] = now
+
+    # Сбрасываем состояние
+    del context.user_data["ordering"]
+
+
+# ---------- /orders (только админы) с пагинацией ----------
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    if not is_admin(user.id):
+    if user.id not in ADMIN_IDS:
         await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
         return
 
-    rows = fetch_last_orders(limit=10)
-    if not rows:
+    # формат: /orders [page]
+    args = context.args if hasattr(context, "args") else []
+    try:
+        page = int(args[0]) if args else 1
+    except ValueError:
+        page = 1
+    page = max(1, page)
+    page_size = 10
+
+    rows, total = fetch_orders_page(page=page, page_size=page_size)
+    if total == 0:
         await safe_reply_text(update.message, "📭 Заявок пока нет.")
         return
 
-    lines = ["📋 Список заявок:\n"]
-    for row in rows:
-        (oid, user_id, username, oil, volume, price, currency, contact, created_at) = row
+    total_pages = (total + page_size - 1) // page_size
+    if not rows:
+        await safe_reply_text(update.message, f"Страница {page}/{total_pages} пуста.")
+        return
+
+    lines = [f"📋 Список заявок — стр. {page}/{total_pages}\n"]
+    for (oid, user_id, username, oil, volume, price, currency, contact, created_at) in rows:
         username_visible = f"@{username}" if username else f"ID:{user_id}"
         lines.append(
             f"#{oid:03} — {oil} ({volume})\n"
@@ -513,10 +491,17 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 {created_at}\n"
         )
 
-    await safe_reply_text(update.message, "\n".join(lines))
+    hints = []
+    if page > 1:
+        hints.append(f"/orders {page-1} ← предыдущая")
+    if page < total_pages:
+        hints.append(f"/orders {page+1} → следующая")
+
+    msg = "\n".join(lines + (["\n" + " | ".join(hints)] if hints else []))
+    await safe_reply_text(update.message, msg)
+
 
 # ---------- О нас / Контакты ----------
-
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -536,40 +521,33 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
 
+
 # ---------- Главная ----------
-
 def main():
-    # подготовим папки
-    ensure_dirs()
-
     # подготовим БД
     init_db()
-
     # разовая миграция из JSON, если таблица ещё пустая
     try:
         migrate_json_to_sql()
     except Exception as e:
         logger.warning("Миграция пропущена/ошибка: %s", e)
 
-    # Бэкап при старте (если БД уже есть)
-    backup_db()
-
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("orders", show_orders))
-    app.add_handler(CommandHandler("exportcsv", exportcsv))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("contacts", contacts))
-    app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("cancel", cancel))
+
     app.add_handler(CallbackQueryHandler(show_oil))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
