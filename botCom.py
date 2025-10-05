@@ -17,7 +17,7 @@ from telegram.ext import (
     filters,
 )
 from catalog import oils  # словарь с маслами
-# test hook 2
+# test hook 3 
 
 # --- Логирование ---
 logging.basicConfig(
