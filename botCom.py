@@ -2,6 +2,11 @@
 import os
 import json
 import logging
+import sqlite3
+import shutil
+import csv
+from datetime import datetime
+
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -17,7 +22,6 @@ from telegram.ext import (
     filters,
 )
 from catalog import oils  # словарь с маслами
-# test hook 3 
 
 # --- Логирование ---
 logging.basicConfig(
@@ -33,53 +37,246 @@ TOKEN = os.getenv("TOKEN")
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
 
-ORDERS_FILE = "orders.json"
-VERSION_FILE = "VERSION"  # используем без расширения .txt
+# --- Пути к данным ---
+ORDERS_FILE = "orders.json"   # старый формат — на случай миграции
+DB_PATH = "orders.db"         # новый SQLite
+BACKUPS_DIR = "backups"
+EXPORTS_DIR = "exports"
 
+# ---------- ВСПОМОГАТЕЛЬНЫЕ ШТУКИ ----------
 
-# --- Работа с версиями ---
-def get_version():
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def ensure_dirs():
+    os.makedirs(BACKUPS_DIR, exist_ok=True)
+    os.makedirs(EXPORTS_DIR, exist_ok=True)
+
+# ---------- РЕЗЕРВНЫЕ КОПИИ БД ----------
+
+def backup_db(keep: int = 7) -> str | None:
+    """
+    Делает копию БД в папку backups/ с таймстампом.
+    Хранит только последние `keep` копий (по времени модификации).
+    Возвращает путь к созданному файлу или None, если БД ещё нет.
+    """
+    ensure_dirs()
+    if not os.path.exists(DB_PATH):
+        logger.info("Бэкап пропущен: %s ещё не создана.", DB_PATH)
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = os.path.join(BACKUPS_DIR, f"orders_{ts}.db")
     try:
-        with open(VERSION_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return "неизвестна"
+        shutil.copy2(DB_PATH, dst)
+        logger.info("Сделан бэкап БД: %s", dst)
     except Exception as e:
-        logger.error("Ошибка чтения VERSION: %s", e)
-        return f"ошибка чтения ({e})"
+        logger.exception("Не удалось сделать бэкап БД: %s", e)
+        return None
 
-
-async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ver = get_version()
-    await update.message.reply_text(f"🤖 Текущая версия бота: {ver}")
-
-
-# --- Функция сохранения заявок  ---
-def save_order(order):
+    # Ротация
     try:
-        if os.path.exists(ORDERS_FILE):
-            with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-                orders = json.load(f)
-        else:
-            orders = []
+        files = sorted(
+            [os.path.join(BACKUPS_DIR, f) for f in os.listdir(BACKUPS_DIR) if f.endswith(".db")],
+            key=lambda p: os.path.getmtime(p),
+            reverse=True,
+        )
+        for f in files[keep:]:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
     except Exception as e:
-        logger.exception("Не удалось прочитать orders.json: %s", e)
-        orders = []
+        logger.warning("Не удалось выполнить ротацию бэкапов: %s", e)
 
-    order_id = len(orders) + 1
-    order["id"] = f"#{order_id:03}"
-    orders.append(order)
+    return dst
+
+# ---------- БАЗА ДАННЫХ (SQLite) ----------
+
+def init_db():
+    """Создаёт таблицу orders при необходимости."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS orders (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT DEFAULT (datetime('now')),
+                user_id    INTEGER,
+                username   TEXT,
+                oil        TEXT,
+                volume     TEXT,
+                price      TEXT,
+                currency   TEXT,
+                contact    TEXT
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def save_order_sql(order: dict) -> str:
+    """
+    Сохраняет заявку в SQLite.
+    Возвращает красивый код заказа вида #001.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO orders (user_id, username, oil, volume, price, currency, contact)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                order.get("user_id"),
+                order.get("username"),
+                order.get("oil"),
+                order.get("volume"),
+                order.get("price"),
+                order.get("currency"),
+                order.get("contact"),
+            ),
+        )
+        conn.commit()
+        row_id = c.lastrowid
+        order_code = f"#{row_id:03}"
+        return order_code
+    finally:
+        conn.close()
+
+def fetch_last_orders(limit: int = 10):
+    """Возвращает последние N заявок (списком кортежей)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, user_id, username, oil, volume, price, currency, contact, created_at
+            FROM orders
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        return c.fetchall()
+    finally:
+        conn.close()
+
+def fetch_all_orders():
+    """Все заявки (для экспорта)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            SELECT id, created_at, user_id, username, oil, volume, price, currency, contact
+            FROM orders
+            ORDER BY id ASC
+            """
+        )
+        return c.fetchall()
+    finally:
+        conn.close()
+
+def db_is_empty() -> bool:
+    """Пуста ли таблица orders (или её нет)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'")
+        if not c.fetchone():
+            return True
+        c.execute("SELECT COUNT(*) FROM orders")
+        count = c.fetchone()[0]
+        return count == 0
+    finally:
+        conn.close()
+
+def migrate_json_to_sql():
+    """
+    Разовая миграция из orders.json в SQLite (если таблица пуста и файл существует).
+    Ставит цену/валюту в '—'/'₽', если в JSON их нет.
+    """
+    if not os.path.exists(ORDERS_FILE):
+        return
+    if not db_is_empty():
+        return
 
     try:
-        with open(ORDERS_FILE, "w", encoding="utf-8") as f:
-            json.dump(orders, f, ensure_ascii=False, indent=2)
+        with open(ORDERS_FILE, "r", encoding="utf-8") as f:
+            orders = json.load(f)
     except Exception as e:
-        logger.exception("Не удалось записать orders.json: %s", e)
+        logger.exception("Не удалось прочитать %s для миграции: %s", ORDERS_FILE, e)
+        return
 
-    return order["id"]
+    if not isinstance(orders, list) or not orders:
+        return
 
+    logger.info("Начинаем миграцию %s -> %s (%d записей)", ORDERS_FILE, DB_PATH, len(orders))
+    conn = sqlite3.connect(DB_PATH)
+    inserted = 0
+    try:
+        c = conn.cursor()
+        for old in orders:
+            try:
+                c.execute(
+                    """
+                    INSERT INTO orders (user_id, username, oil, volume, price, currency, contact)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        old.get("user_id"),
+                        old.get("username"),
+                        old.get("oil"),
+                        old.get("volume"),
+                        old.get("price", "—"),
+                        old.get("currency", "₽"),
+                        old.get("contact"),
+                    ),
+                )
+                inserted += 1
+            except Exception as e:
+                logger.warning("Пропущена запись при миграции: %s", e)
+        conn.commit()
+        logger.info("Миграция завершена, импортировано: %d", inserted)
+    finally:
+        conn.close()
 
-# --- Error handler ---
+# ---------- ЭКСПОРТ CSV (для админов) ----------
+
+def export_orders_csv() -> str | None:
+    """
+    Экспорт всех заявок в CSV (UTF-8 BOM, чтобы Excel открыл корректно).
+    Возвращает путь к файлу или None, если заявок нет.
+    """
+    ensure_dirs()
+    rows = fetch_all_orders()
+    if not rows:
+        return None
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(EXPORTS_DIR, f"orders_{ts}.csv")
+
+    headers = ["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"]
+
+    try:
+        # UTF-8 BOM чтобы Excel не ломал кириллицу
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            writer.writerow(headers)
+            for row in rows:
+                writer.writerow(row)
+    except Exception as e:
+        logger.exception("Не удалось записать CSV экспорт: %s", e)
+        return None
+
+    return path
+
+# ---------- УТИЛИТЫ ОТПРАВКИ ----------
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
     for admin_id in ADMIN_IDS:
@@ -91,8 +288,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             logger.debug("Не удалось уведомить админа %s", admin_id)
 
-
-# --- Вспомогательная безопасная отправка ---
 async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
     try:
         return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
@@ -104,8 +299,8 @@ async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kw
             logger.exception("reply_text повторно упал")
     return None
 
+# ---------- КОМАНДЫ ----------
 
-# --- Команды ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -115,17 +310,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/catalog — открыть каталог\n"
         "/about — о компании\n"
         "/contacts — контакты\n"
-        #"/orders — список заявок (для админов)\n"
+        "/orders — список заявок (для админов)\n"
+        "/exportcsv — экспорт заявок в CSV (админы)\n"
         "/id — показать ваш Telegram ID\n"
         "/cancel — отменить оформление заявки\n"
-        "/version — показать версию бота\n"
         "/start — показать это сообщение",
     )
 
-
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(update.message, f"Ваш Telegram ID: {update.effective_user.id}")
-
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "ordering" in context.user_data:
@@ -134,8 +327,31 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_reply_text(update.message, "Нечего отменять. Напишите /catalog чтобы открыть каталог.")
 
+# --- Экспорт CSV (только для админов)
+async def exportcsv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await safe_reply_text(update.message, "⛔ Команда доступна только администраторам.")
+        return
 
-# --- Каталог ---
+    path = export_orders_csv()
+    if not path:
+        await safe_reply_text(update.message, "📭 Экспорт невозможен — заявок пока нет.")
+        return
+
+    try:
+        with open(path, "rb") as f:
+            await update.message.reply_document(
+                document=f,
+                filename=os.path.basename(path),
+                caption="Экспорт заявок (CSV).",
+            )
+    except Exception as e:
+        logger.exception("Не удалось отправить CSV: %s", e)
+        await safe_reply_text(update.message, "⚠️ Не удалось отправить CSV-файл.")
+
+# ---------- КАТАЛОГ / КНОПКИ ----------
+
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton(f"{oil['name']} ({oil['volume']})", callback_data=str(oil_id))]
@@ -163,8 +379,6 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
 
-
-# --- Обработка кнопок ---
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -221,8 +435,8 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup,
         )
 
+# ---------- ОБРАБОТКА ЗАЯВОК ----------
 
-# --- Обработка заявок ---
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
@@ -242,13 +456,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "contact": text,
         }
 
-        order_id = save_order(order)
+        # Сохраняем в SQLite
+        order_id = save_order_sql(order)
 
         await update.message.reply_text(
             f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
             f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
             f"Контакты: {text}"
         )
+
+        # Бэкап после новой записи
+        backup_db()
 
         for admin_id in ADMIN_IDS:
             try:
@@ -269,43 +487,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
 
+# ---------- /orders (только админы) ----------
 
-# --- Команда /orders ---
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
-    if user.id not in ADMIN_IDS:
+    if not is_admin(user.id):
         await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
         return
 
-    try:
-        if os.path.exists(ORDERS_FILE):
-            with open(ORDERS_FILE, "r", encoding="utf-8") as f:
-                orders = json.load(f)
-        else:
-            orders = []
-    except Exception as e:
-        logger.exception("Ошибка чтения orders.json: %s", e)
-        orders = []
-
-    if not orders:
+    rows = fetch_last_orders(limit=10)
+    if not rows:
         await safe_reply_text(update.message, "📭 Заявок пока нет.")
         return
 
     lines = ["📋 Список заявок:\n"]
-    for order in orders[-10:]:
-        username_visible = order.get("username") or f"ID:{order.get('user_id')}"
+    for row in rows:
+        (oid, user_id, username, oil, volume, price, currency, contact, created_at) = row
+        username_visible = f"@{username}" if username else f"ID:{user_id}"
         lines.append(
-            f"{order.get('id', '?')} — {order['oil']} ({order['volume']})\n"
-            f"💰 Цена: {order.get('price', '—')} {order.get('currency', '₽')}\n"
+            f"#{oid:03} — {oil} ({volume})\n"
+            f"💰 Цена: {price or '—'} {currency or '₽'}\n"
             f"👤 От: {username_visible}\n"
-            f"📞 Контакты: {order['contact']}\n"
+            f"📞 Контакты: {contact}\n"
+            f"🕒 {created_at}\n"
         )
 
     await safe_reply_text(update.message, "\n".join(lines))
 
+# ---------- О нас / Контакты ----------
 
-# --- Команда /about ---
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -316,8 +527,6 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🕘 Время работы: 9:00 — 21:00",
     )
 
-
-# --- Команда /contacts ---
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         update.message,
@@ -327,26 +536,40 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
 
+# ---------- Главная ----------
 
-# --- Главная функция ---
 def main():
+    # подготовим папки
+    ensure_dirs()
+
+    # подготовим БД
+    init_db()
+
+    # разовая миграция из JSON, если таблица ещё пустая
+    try:
+        migrate_json_to_sql()
+    except Exception as e:
+        logger.warning("Миграция пропущена/ошибка: %s", e)
+
+    # Бэкап при старте (если БД уже есть)
+    backup_db()
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("orders", show_orders))
+    app.add_handler(CommandHandler("exportcsv", exportcsv))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("contacts", contacts))
     app.add_handler(CommandHandler("id", my_id))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("version", version))
     app.add_handler(CallbackQueryHandler(show_oil))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
