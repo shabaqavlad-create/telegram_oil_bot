@@ -17,6 +17,7 @@ from telegram.ext import (
     filters,
 )
 from catalog import oils  # словарь с маслами
+# test hook 2
 
 # --- Логирование ---
 logging.basicConfig(
@@ -53,7 +54,7 @@ async def version(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Текущая версия бота: {ver}")
 
 
-# --- Функция сохранения заявок ---
+# --- Функция сохранения заявок  ---
 def save_order(order):
     try:
         if os.path.exists(ORDERS_FILE):
@@ -114,7 +115,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/catalog — открыть каталог\n"
         "/about — о компании\n"
         "/contacts — контакты\n"
-        "/orders — список заявок (для админов)\n"
+        #"/orders — список заявок (для админов)\n"
         "/id — показать ваш Telegram ID\n"
         "/cancel — отменить оформление заявки\n"
         "/version — показать версию бота\n"
