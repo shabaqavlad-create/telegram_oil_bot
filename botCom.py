@@ -673,6 +673,8 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------- Главная ----------
+from telegram.request import HTTPXRequest
+
 def main():
     # подготовим БД + миграция
     init_db()
@@ -681,34 +683,49 @@ def main():
     except Exception as e:
         logger.warning("Миграция пропущена/ошибка: %s", e)
 
-    app = Application.builder().token(TOKEN).build()
+    # ✅ более стабильный httpx-клиент
+    request = HTTPXRequest(
+        connection_pool_size=20,
+        read_timeout=60,      # ждем ответы дольше
+        write_timeout=60,
+        connect_timeout=15,
+        pool_timeout=15,
+    )
 
-    # Команды
+    # создаем приложение с расширенным клиентом
+    app = Application.builder().token(TOKEN).request(request).build()
+
+    # --- Команды ---
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("orders", show_orders))
-# чтобы работали кликабельные /orders_2, /orders_3, ...
+    # кликабельные /orders_2, /orders_3 и т.д.
     app.add_handler(MessageHandler(filters.Regex(r"^/orders_\d+$"), show_orders))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("contacts", contacts))
     app.add_handler(CommandHandler("cancel", cancel))
-    # Экспорт
     app.add_handler(CommandHandler("exportcsv", export_csv))
     app.add_handler(CommandHandler("exportxcsv", export_csv))  # алиас
     app.add_handler(CommandHandler("exportxlsx", export_xlsx))
 
-    # Кнопки (callback)
+    # --- Кнопки (callback) ---
     app.add_handler(CallbackQueryHandler(show_oil))
 
-    # Сообщения
-    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))               # кнопка «Отправить телефон»
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))  # фоллбек текстом
+    # --- Сообщения ---
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Ошибки
+    # --- Ошибки ---
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
-    app.run_polling()
+
+    # ✅ Увеличены таймауты long-polling
+    app.run_polling(
+        timeout=60,             # держим соединение до 60 секунд
+        poll_interval=1.5,      # пауза между циклами (уменьшает нагрузку)
+        drop_pending_updates=True,  # сбрасываем старые апдейты при старте
+    )
 
 
 if __name__ == "__main__":
