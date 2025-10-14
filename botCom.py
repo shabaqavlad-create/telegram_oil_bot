@@ -1,3 +1,5 @@
+# bot.py
+
 # --- Импорты ---
 import os
 import json
@@ -7,6 +9,7 @@ import re
 import time
 import io
 import csv
+import html
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -17,6 +20,9 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -25,8 +31,8 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
-    filters,
 )
+from telegram.ext import filters as F
 from telegram.request import HTTPXRequest
 from openpyxl import Workbook
 
@@ -42,23 +48,89 @@ logger = logging.getLogger(__name__)
 # --- Настройка токена и админов ---
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("Не найден TOKEN в окружении (.env). Укажите TOKEN=<...>")
 
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
+if not ADMIN_IDS:
+    logger.warning("ADMIN_IDS пуст — админские команды будут недоступны ни для кого.")
 
 # --- Пути к данным ---
-ORDERS_FILE = "orders.json"   # на случай миграции
-DB_PATH = "orders.db"         # SQLite
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ORDERS_FILE = os.path.join(BASE_DIR, "orders.json")  # на случай миграции
+DB_PATH = os.path.join(BASE_DIR, "orders.db")        # SQLite
 
 # --- Антиспам ---
-ORDER_COOLDOWN_SEC = 30
+ORDER_COOLDOWN_SEC = 20
 LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней УСПЕШНОЙ заявки
+
+# --- Константы UI ---
+CAPTION_LIMIT = 1024  # безопасный лимит подписи к фото
+
+
+# ---------- УТИЛИТЫ (общие) ----------
+
+def truncate(s: str, limit: int = CAPTION_LIMIT) -> str:
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def target_message(update: Update):
+    """Возвращает сообщение, в которое безопасно отвечать (callback или обычное)."""
+    return update.callback_query.message if update.callback_query else update.message
+
+
+async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
+    """Безопасный reply_text с fallback без parse_mode."""
+    try:
+        return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
+    except Exception as e:
+        logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
+        try:
+            return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
+        except Exception:
+            logger.exception("reply_text повторно упал")
+    return None
+
+
+async def reply_to_update(update: Update, text: str, **kwargs):
+    """Безопасно ответить в тот же контекст, откуда пришёл апдейт (callback/сообщение)."""
+    msg = target_message(update)
+    if msg:
+        return await safe_reply_text(msg, text, **kwargs)
+
+
+async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
+    """Ненавязчивый индикатор 'печатает…'."""
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        return
+    if seconds > 0:
+        import asyncio
+        await asyncio.sleep(seconds)
 
 
 # ---------- БАЗА ДАННЫХ (SQLite) ----------
+
+def get_conn():
+    """Единая точка подключения: WAL, busy_timeout, FK и др."""
+    conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)  # autocommit
+    c = conn.cursor()
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    c.execute("PRAGMA foreign_keys=ON;")
+    c.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+
 def init_db():
-    """Создаёт таблицу orders при необходимости."""
-    conn = sqlite3.connect(DB_PATH)
+    """Создаёт таблицу orders и индексы при необходимости."""
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
@@ -76,14 +148,17 @@ def init_db():
             )
             """
         )
-        conn.commit()
+        # индексы
+        c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id   ON orders(user_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_orders_oil       ON orders(oil)")
     finally:
         conn.close()
 
 
 def save_order_sql(order: dict) -> str:
     """Сохраняет заявку и возвращает код вида #001."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
@@ -101,7 +176,6 @@ def save_order_sql(order: dict) -> str:
                 order.get("contact"),
             ),
         )
-        conn.commit()
         row_id = c.lastrowid
         return f"#{row_id:03}"
     finally:
@@ -112,7 +186,7 @@ def fetch_orders_page(page: int, page_size: int = 10):
     """Постраничная выборка. Возвращает (rows, total)."""
     page = max(1, page)
     offset = (page - 1) * page_size
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM orders")
@@ -134,7 +208,7 @@ def fetch_orders_page(page: int, page_size: int = 10):
 
 
 def db_is_empty() -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='orders'")
@@ -164,7 +238,7 @@ def migrate_json_to_sql():
         return
 
     logger.info("Начинаем миграцию %s -> %s (%d записей)", ORDERS_FILE, DB_PATH, len(orders))
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     inserted = 0
     try:
         c = conn.cursor()
@@ -188,13 +262,13 @@ def migrate_json_to_sql():
                 inserted += 1
             except Exception as e:
                 logger.warning("Пропущена запись при миграции: %s", e)
-        conn.commit()
         logger.info("Миграция завершена, импортировано: %d", inserted)
     finally:
         conn.close()
 
 
 # ---------- ВАЛИДАЦИЯ КОНТАКТА ----------
+
 PHONE_RE = re.compile(
     r"""^\s*
         (?:
@@ -220,11 +294,7 @@ def validate_contact(text: str) -> tuple[bool, str | None]:
     return True, text.strip()
 
 
-# ---------- УТИЛИТЫ ----------
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
+# ---------- Ошибки ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
     for admin_id in ADMIN_IDS:
@@ -237,50 +307,24 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             logger.debug("Не удалось уведомить админа %s", admin_id)
 
 
-async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
-    try:
-        return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
-    except Exception as e:
-        logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
-        try:
-            return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
-        except Exception:
-            logger.exception("reply_text повторно упал")
-    return None
+# ---------- СТАТИСТИКА / АДМИН ----------
 
-
-# --- мини-хелпер: показать «печатает…» ---
-async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        return
-    if seconds > 0:
-        import asyncio
-        await asyncio.sleep(seconds)
-
-
-# ---------- СТАТИСТИКА ----------
 def fetch_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
-        # всего заявок
         c.execute("SELECT COUNT(*) FROM orders")
         total = c.fetchone()[0] or 0
 
-        # за 7 дней
         c.execute("""
             SELECT COUNT(*) FROM orders
             WHERE created_at >= datetime('now','-7 days')
         """)
         last7 = c.fetchone()[0] or 0
 
-        # уникальные пользователи
         c.execute("SELECT COUNT(DISTINCT user_id) FROM orders")
         uniq_users = c.fetchone()[0] or 0
 
-        # топ-5 товаров
         c.execute("""
             SELECT oil, COUNT(*) as cnt
             FROM orders
@@ -288,23 +332,15 @@ def fetch_stats():
             ORDER BY cnt DESC
             LIMIT 5
         """)
-        top = c.fetchall()  # [(oil, cnt), ...]
-
-        return {
-            "total": total,
-            "last7": last7,
-            "uniq_users": uniq_users,
-            "top": top,
-        }
+        top = c.fetchall()
+        return {"total": total, "last7": last7, "uniq_users": uniq_users, "top": top}
     finally:
         conn.close()
 
 
-# ---------- КОМАНДЫ ----------
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Команда доступна только администраторам.")
+    if update.effective_user.id not in ADMIN_IDS:
+        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
         return
 
     s = fetch_stats()
@@ -317,85 +353,110 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🏆 Топ-5 товаров:",
     ]
     if s["top"]:
-        for oil, cnt in s["top"]:
-            lines.append(f"  — {oil}: {cnt}")
+        for oil_name, cnt in s["top"]:
+            lines.append(f"  — {oil_name}: {cnt}")
     else:
         lines.append("  — пока нет данных")
 
-    await update.message.reply_text("\n".join(lines))
+    await reply_to_update(update, "\n".join(lines))
 
+
+async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показ версии — только админам."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    path = os.path.join(BASE_DIR, "VERSION")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            await reply_to_update(update, f"Версия: {f.read().strip()}")
+    except FileNotFoundError:
+        await reply_to_update(update, "VERSION не найден.")
+
+
+# ---------- START / Меню ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     is_admin_user = user_id in ADMIN_IDS
 
-    # базовый текст
     text = (
         "Привет! 👋\n"
         "Я бот-магазин масел для электромобилей и гибридов.\n\n"
-        "📌 Команды:\n"
-        "/catalog — открыть каталог\n"
-        "/about — о компании\n"
-        "/contacts — контакты\n"
-        "/find <текст> — поиск по каталогу\n"
+        "🛠 Используйте кнопки ниже, чтобы открыть каталог, узнать о компании или связаться с нами.\n\n"
+        "📌 Дополнительно:\n"
         "/cancel — отменить оформление заявки\n"
         "/start — показать это сообщение"
     )
 
-    # блок для админов
     if is_admin_user:
         text += (
             "\n\n👑 Команды для админов:\n"
             "/orders [страница] — заявки\n"
             "/exportxlsx — выгрузка заявок в XLSX\n"
             "/exportcsv — выгрузка заявок в CSV\n"
-            "/stats — статистика"
+            "/stats — статистика\n"
+            "/version — текущая версия"
         )
 
-    # стартовые кнопки
     keyboard = [
-        [InlineKeyboardButton("🛒 Открыть каталог", callback_data="open_catalog")],
-        [InlineKeyboardButton("🔎 Поиск", callback_data="open_search_hint")],
+        [
+            InlineKeyboardButton("🛒 Каталог", callback_data="open_catalog"),
+            InlineKeyboardButton("ℹ️ О компании", callback_data="open_about"),
+        ],
+        [
+            InlineKeyboardButton("📞 Контакты", callback_data="open_contacts"),
+            InlineKeyboardButton("🔎 Поиск", callback_data="open_search_hint"),
+        ],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await safe_reply_text(update.message, text, reply_markup=reply_markup)
+    await reply_to_update(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
 
 
-# --- обработка кнопок из стартового меню ---
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+
     if query.data == "open_catalog":
         await show_typing(context, query.message.chat.id, 0.5)
         await show_catalog(update, context)
+
     elif query.data == "open_search_hint":
-        await query.message.reply_text("Введите запрос командой:\n/find castrol 1 л")
+        await reply_to_update(update, "Введите запрос командой:\n/find castrol 1 л")
+
+    elif query.data == "open_about":
+        await about(update, context)
+
+    elif query.data == "open_contacts":
+        await contacts(update, context)
 
 
-# --- Поиск по каталогу ---
+# ---------- Поиск ----------
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", s.lower()).strip()
+
 async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_query = " ".join(context.args).strip().lower() if context.args else ""
+    user_query = norm(" ".join(context.args)) if context.args else ""
     if not user_query:
-        await update.message.reply_text("Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
+        await reply_to_update(update, "Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
         return
 
     await show_typing(context, update.effective_chat.id, 0.5)
 
     results = []
     for oid, oil in oils.items():
-        blob = " ".join([
+        blob = norm(" ".join([
             oil.get("name", ""),
             oil.get("volume", ""),
             oil.get("description", ""),
             " ".join(oil.get("features", [])),
-            oil.get("compatible", "")
-        ]).lower()
-        if all(tok in blob for tok in user_query.split()):
+            oil.get("compatible", ""),
+        ]))
+        # терпим к пробелам/регистру
+        if all(tok.replace(" ", "") in blob.replace(" ", "") for tok in user_query.split()):
             results.append((oid, oil))
 
     if not results:
-        await update.message.reply_text("Ничего не нашлось 🤷\nПопробуйте короче или по-другому.")
+        await reply_to_update(update, "Ничего не нашлось 🤷\nПопробуйте короче или по-другому.")
         return
 
     keyboard = [
@@ -403,14 +464,21 @@ async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for oid, oil in results[:10]
     ]
     keyboard.append([InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")])
-    await update.message.reply_text(
+    await reply_to_update(
+        update,
         f"Найдено: {len(results)}. Показаны первые {min(len(results),10)}:",
-        reply_markup=InlineKeyboardMarkup(keyboard)
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-# ---------- КАТАЛОГ / КНОПКИ ----------
+# ---------- Каталог ----------
+
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # защита на пустой каталог
+    if not oils:
+        await reply_to_update(update, "Каталог временно пуст. Попробуйте позже или напишите нам: @shaba_v")
+        return
+
     await show_typing(context, update.effective_chat.id, 0.6)
 
     keyboard = [
@@ -437,7 +505,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await safe_reply_text(query.message, "Выберите масло:", reply_markup=reply_markup)
     else:
-        await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
+        await reply_to_update(update, "Выберите масло:", reply_markup=reply_markup)
 
 
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -452,11 +520,12 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Оставить заявку
     if data.startswith("order_"):
         oil_id = int(data.split("_")[1])
-        oil = oils[oil_id]
+        oil = oils.get(oil_id)
+        if not oil:
+            await reply_to_update(update, "Товар больше не доступен. Откройте /catalog и выберите заново.")
+            return
 
-        # ненавязчивый "тост"
         await query.answer("Ок, оформим заявку. Отправьте контакт 👇", show_alert=False)
-
         text = (
             f"🛒 Вы выбрали:\n"
             f"{oil['name']} ({oil['volume']}) — {oil.get('price', 'цена не указана')} {oil.get('currency', '₽')}\n\n"
@@ -477,20 +546,20 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Показ карточки масла
     if data.isdigit():
         oil_id = int(data)
-        if oil_id not in oils:
-            await safe_reply_text(query.message, "❌ Ошибка: товар не найден.")
+        oil = oils.get(oil_id)
+        if not oil:
+            await reply_to_update(update, "❌ Ошибка: товар не найден.")
             return
 
         await show_typing(context, update.effective_chat.id, 0.6)
 
-        oil = oils[oil_id]
         caption = (
-            f"🔹 *{oil['name']}* ({oil['volume']})\n\n"
-            f"{oil['description']}\n\n"
-            f"💰 Цена: {oil.get('price', 'не указана')} {oil.get('currency', '₽')}\n\n"
-            "Характеристики:\n"
-            + "\n".join([f"• {f}" for f in oil["features"]])
-            + f"\n\nПодходит: {oil['compatible']}"
+            f"🔹 <b>{html.escape(oil['name'])}</b> ({html.escape(oil['volume'])})\n\n"
+            f"{html.escape(oil['description'])}\n\n"
+            f"💰 Цена: {html.escape(str(oil.get('price', 'не указана')))} {html.escape(oil.get('currency', '₽'))}\n\n"
+            "Характеристики:\n" +
+            "\n".join([f"• {html.escape(f)}" for f in oil["features"]]) +
+            f"\n\nПодходит: {html.escape(oil['compatible'])}"
         )
         keyboard = [
             [InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")],
@@ -506,22 +575,23 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_photo(
             photo=oil["image"],
-            caption=caption,
-            parse_mode="Markdown",
+            caption=truncate(caption),
+            parse_mode="HTML",
             reply_markup=reply_markup,
         )
 
 
 # ---------- ОБРАБОТКА ЗАЯВОК ----------
+
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Путь 1: пользователь нажал «Отправить телефон»."""
     if "ordering" not in context.user_data:
-        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
+        await reply_to_update(update, "Используйте /catalog чтобы выбрать масло.")
         return
 
     user = update.effective_user
     if not update.message.contact or not update.message.contact.phone_number:
-        await update.message.reply_text("Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
+        await reply_to_update(update, "Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
         return
 
     contact = update.message.contact.phone_number.strip()
@@ -532,12 +602,22 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last is not None:
         remain = ORDER_COOLDOWN_SEC - int(now - last)
         if remain > 0:
-            await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
+            await reply_to_update(update, f"⏳ Слишком часто. Повторите через {remain} сек.")
             return
 
-    oil_id = context.user_data["ordering"]
-    oil = oils[oil_id]
+    oil_id = context.user_data.get("ordering")
+    oil = oils.get(oil_id)
+    if not oil:
+        await reply_to_update(
+            update,
+            "Товар больше не доступен. Откройте /catalog и выберите заново.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("ordering", None)
+        return
+
     username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
+    logger.info("ORDER by %s (%s): %s %s / %s", user.id, user.username, oil['name'], oil['volume'], contact)
 
     order = {
         "user_id": user.id,
@@ -550,7 +630,8 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     order_id = save_order_sql(order)
 
-    await update.message.reply_text(
+    await reply_to_update(
+        update,
         f"✅ Заявка {order_id} создана!\n"
         f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
         f"Контакт: {contact}\n"
@@ -574,7 +655,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
 
     LAST_ORDER_AT[user.id] = now
-    del context.user_data["ordering"]
+    context.user_data.pop("ordering", None)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,26 +664,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if "ordering" not in context.user_data:
-        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
+        await reply_to_update(update, "Используйте /catalog чтобы выбрать масло.")
         return
 
-    ok, norm = validate_contact(text)
+    ok, norm_contact = validate_contact(text)
     if not ok:
-        await update.message.reply_text(norm)
+        await reply_to_update(update, norm_contact)
         return
-    contact = norm
+    contact = norm_contact
 
     now = time.time()
     last = LAST_ORDER_AT.get(user.id)
     if last is not None:
         remain = ORDER_COOLDOWN_SEC - int(now - last)
         if remain > 0:
-            await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
+            await reply_to_update(update, f"⏳ Слишком часто. Повторите через {remain} сек.")
             return
 
-    oil_id = context.user_data["ordering"]
-    oil = oils[oil_id]
+    oil_id = context.user_data.get("ordering")
+    oil = oils.get(oil_id)
+    if not oil:
+        await reply_to_update(
+            update,
+            "Товар больше не доступен. Откройте /catalog и выберите заново.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("ordering", None)
+        return
+
     username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
+    logger.info("ORDER by %s (%s): %s %s / %s", user.id, user.username, oil['name'], oil['volume'], contact)
 
     order = {
         "user_id": user.id,
@@ -615,7 +706,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     order_id = save_order_sql(order)
 
-    await update.message.reply_text(
+    await reply_to_update(
+        update,
         f"✅ Заявка {order_id} создана!\n"
         f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
         f"Контакт: {contact}\n"
@@ -639,14 +731,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
 
     LAST_ORDER_AT[user.id] = now
-    del context.user_data["ordering"]
+    context.user_data.pop("ordering", None)
 
 
-# ---------- /orders (только админы) с пагинацией ----------
+# ---------- /orders (только админы) ----------
+
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
-        await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
+    if update.effective_user.id not in ADMIN_IDS:
+        await reply_to_update(update, f"⛔ У вас нет доступа. Ваш ID: {update.effective_user.id}")
         return
 
     # извлекаем страницу из "/orders N" или "/orders_N"
@@ -670,12 +762,12 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows, total = fetch_orders_page(page=page, page_size=page_size)
     if total == 0:
-        await safe_reply_text(update.message, "📭 Заявок пока нет.")
+        await reply_to_update(update, "📭 Заявок пока нет.")
         return
 
     total_pages = (total + page_size - 1) // page_size
     if not rows:
-        await safe_reply_text(update.message, f"Страница {page}/{total_pages} пуста.")
+        await reply_to_update(update, f"Страница {page}/{total_pages} пуста.")
         return
 
     lines = [f"📋 Список заявок — стр. {page}/{total_pages}\n"]
@@ -696,17 +788,17 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         hints.append(f"/orders_{page+1} → следующая")
 
     msg = "\n".join(lines + (["\n" + " | ".join(hints)] if hints else []))
-    await safe_reply_text(update.message, msg)
+    await reply_to_update(update, msg)
 
 
 # ---------- ЭКСПОРТЫ (только админы) ----------
+
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Команда доступна только администраторам.")
+    if not is_admin(update.effective_user.id):
+        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
@@ -721,33 +813,37 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
     if not rows:
-        await update.message.reply_text("📭 Заявок пока нет.")
+        await reply_to_update(update, "📭 Заявок пока нет.")
         return
 
     txt = io.StringIO()
     writer = csv.writer(txt)
-    writer.writerow(["id","created_at","user_id","username","oil","volume","price","currency","contact"])
+    writer.writerow(["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"])
     writer.writerows(rows)
 
-    bio = io.BytesIO(txt.getvalue().encode("utf-8"))
+    # UTF-8 BOM, чтобы Excel корректно открыл кириллицу
+    bio = io.BytesIO(("\ufeff" + txt.getvalue()).encode("utf-8"))
     bio.seek(0)
 
     filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=bio,
-        filename=filename,
-        caption="Экспорт заявок (CSV)",
-    )
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=bio,
+            filename=filename,
+            caption="Экспорт заявок (CSV)",
+        )
+    except Exception as e:
+        logger.exception("Не удалось отправить файл экспорта CSV: %s", e)
+        await reply_to_update(update, "⚠️ Не удалось отправить CSV. Попробуйте ещё раз позже.")
 
 
 async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
-        await update.message.reply_text("⛔ Команда доступна только администраторам.")
+    if not is_admin(update.effective_user.id):
+        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         c = conn.cursor()
         c.execute(
@@ -762,34 +858,44 @@ async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
     if not rows:
-        await update.message.reply_text("📭 Заявок пока нет.")
+        await reply_to_update(update, "📭 Заявок пока нет.")
         return
 
     wb = Workbook()
     ws = wb.active
     ws.title = "orders"
-    headers = ["id","created_at","user_id","username","oil","volume","price","currency","contact"]
+    headers = ["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"]
     ws.append(headers)
     for r in rows:
         ws.append(list(r))
+
+    # автоширина колонок
+    for col in ws.columns:
+        max_len = max(len(str(cell.value)) if cell.value is not None else 0 for cell in col)
+        ws.column_dimensions[col[0].column_letter].width = min(max(10, max_len + 2), 50)
 
     bio = io.BytesIO()
     wb.save(bio)
     bio.seek(0)
 
     filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    await context.bot.send_document(
-        chat_id=update.effective_chat.id,
-        document=bio,
-        filename=filename,
-        caption="Экспорт заявок (XLSX)",
-    )
+    try:
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=bio,
+            filename=filename,
+            caption="Экспорт заявок (XLSX)",
+        )
+    except Exception as e:
+        logger.exception("Не удалось отправить файл экспорта XLSX: %s", e)
+        await reply_to_update(update, "⚠️ Не удалось отправить XLSX. Попробуйте ещё раз позже.")
 
 
 # ---------- О нас / Контакты ----------
+
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply_text(
-        update.message,
+    await reply_to_update(
+        update,
         "🏪 О нас\n\n"
         "Мы занимаемся продажей оригинальных масел для электромобилей и гибридных автомобилей.\n"
         "🔧 Только проверенные бренды.\n\n"
@@ -799,29 +905,70 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply_text(
-        update.message,
+    await reply_to_update(
+        update,
         "📞 Наши контакты:\n\n"
         "Телефон: +7 (999) 559-39-17 - Андрей, +7 (953) 046-36-54 - Влад\n"
         "Telegram: @shaba_v, @andrey_matveev\n"
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
-# ---------- CANCEL ----------
+
+
+# ---------- CANCEL / UNKNOWN ----------
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет оформление заявки и убирает клавиатуру."""
     if "ordering" in context.user_data:
-        del context.user_data["ordering"]
-        await update.message.reply_text(
+        context.user_data.pop("ordering", None)
+        await reply_to_update(
+            update,
             "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
             reply_markup=ReplyKeyboardRemove(),
         )
     else:
-        await update.message.reply_text(
+        await reply_to_update(
+            update,
             "Нечего отменять. Напишите /catalog чтобы открыть каталог.",
             reply_markup=ReplyKeyboardRemove(),
         )
 
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await reply_to_update(update, "Я не знаю эту команду. Попробуйте /start или /catalog.")
+
+
+# ---------- Меню команд (красота) ----------
+
+async def set_bot_commands(app: Application):
+    # для всех
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "стартовое сообщение"),
+            BotCommand("catalog", "открыть каталог"),
+            BotCommand("about", "о компании"),
+            BotCommand("contacts", "контакты"),
+            BotCommand("find", "поиск по каталогу"),
+            BotCommand("cancel", "отменить оформление"),
+        ], scope=BotCommandScopeDefault())
+    except Exception as e:
+        logger.warning("Не удалось установить общие команды: %s", e)
+
+    # для админов — персональные команды в их чатах
+    for admin_id in ADMIN_IDS:
+        try:
+            await app.bot.set_my_commands([
+                BotCommand("orders", "заявки (/orders 2 — страница 2)"),
+                BotCommand("exportcsv", "выгрузка заявок (CSV)"),
+                BotCommand("exportxlsx", "выгрузка заявок (XLSX)"),
+                BotCommand("stats", "статистика"),
+                BotCommand("version", "версия бота"),
+            ], scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning("Не удалось задать команды для админа %s: %s", admin_id, e)
+
+
 # ---------- Главная ----------
+
 def main():
     # подготовим БД + миграция
     init_db()
@@ -841,30 +988,43 @@ def main():
 
     app = Application.builder().token(TOKEN).request(request).build()
 
+    # После инициализации — задать меню команд
+    app.post_init = set_bot_commands
+
+    # фильтр "только админам"
+    admin_filter = F.User(user_id=ADMIN_IDS)
+
     # --- Команды ---
-    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("find", find_oil))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
-    app.add_handler(CommandHandler("orders", show_orders))
-    # кликабельные /orders_2, /orders_3 и т.д.
-    app.add_handler(MessageHandler(filters.Regex(r"^/orders_\d+$"), show_orders))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("contacts", contacts))
     app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("exportcsv", export_csv))
-    app.add_handler(CommandHandler("exportxcsv", export_csv))  # алиас
-    app.add_handler(CommandHandler("exportxlsx", export_xlsx))
+
+    # Админские
+    app.add_handler(CommandHandler("orders", show_orders, filters=admin_filter))
+    app.add_handler(MessageHandler(F.Regex(r"^/orders_\d+$") & admin_filter, show_orders))
+    app.add_handler(CommandHandler("exportcsv", export_csv, filters=admin_filter))
+    app.add_handler(CommandHandler("exportxcsv", export_csv, filters=admin_filter))  # алиас
+    app.add_handler(CommandHandler("exportxlsx", export_xlsx, filters=admin_filter))
+    app.add_handler(CommandHandler("stats", stats, filters=admin_filter))
+    app.add_handler(CommandHandler("version", version_cmd, filters=admin_filter))
 
     # --- Кнопки (callback) ---
-    # Сначала кнопки стартового меню:
-    app.add_handler(CallbackQueryHandler(handle_start_button, pattern=r"^(open_catalog|open_search_hint)$"))
-    # Затем карточки каталога: back | order_<id> | <id>
+    # Стартовое меню: ловим все четыре кнопки
+    app.add_handler(CallbackQueryHandler(
+        handle_start_button,
+        pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts)$"
+    ))
+    # Карточки каталога: back | order_<id> | <id>
     app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
 
     # --- Сообщения ---
-    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(F.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(F.TEXT & ~F.COMMAND, handle_message))
+    # Unknown command — в самом конце
+    app.add_handler(MessageHandler(F.COMMAND, unknown_command))
 
     # --- Ошибки ---
     app.add_error_handler(error_handler)
