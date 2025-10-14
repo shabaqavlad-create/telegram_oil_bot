@@ -1,15 +1,25 @@
-# виртуальное окружение
-.venv/
+# python
 __pycache__/
-*.pyc
+*.py[cod]
+.venv/
+env/
+venv/
 
-# чувствительные файлы
+# os
+.DS_Store
+Thumbs.db
+
+# local data
+orders.db
+orders.db-*
+*.sqlite3
+*.sqlite
+
+# logs & exports
+*.log
+exports/
+*.csv
+*.xlsx
+
+# dotenv
 .env
-oils.json
-orders.json
-
-# локальные настройки vscode
-.vscode/
-
-#пояснялки
-requirements-dev.txt
