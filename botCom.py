@@ -7,9 +7,7 @@ import re
 import time
 import io
 import csv
-from collections import Counter #для добавления статс
 from datetime import datetime
-
 
 from dotenv import load_dotenv
 from telegram import (
@@ -20,6 +18,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -28,7 +27,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 from openpyxl import Workbook
+
 from catalog import oils  # словарь с маслами
 
 # --- Логирование ---
@@ -52,6 +53,7 @@ DB_PATH = "orders.db"         # SQLite
 # --- Антиспам ---
 ORDER_COOLDOWN_SEC = 30
 LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней УСПЕШНОЙ заявки
+
 
 # ---------- БАЗА ДАННЫХ (SQLite) ----------
 def init_db():
@@ -105,43 +107,6 @@ def save_order_sql(order: dict) -> str:
     finally:
         conn.close()
 
-def fetch_stats():
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        c = conn.cursor()
-        # всего заявок
-        c.execute("SELECT COUNT(*) FROM orders")
-        total = c.fetchone()[0] or 0
-
-        # за 7 дней
-        c.execute("""
-            SELECT COUNT(*) FROM orders
-            WHERE created_at >= datetime('now','-7 days')
-        """)
-        last7 = c.fetchone()[0] or 0
-
-        # уникальные пользователи
-        c.execute("SELECT COUNT(DISTINCT user_id) FROM orders")
-        uniq_users = c.fetchone()[0] or 0
-
-        # топ-5 товаров
-        c.execute("""
-            SELECT oil, COUNT(*) as cnt
-            FROM orders
-            GROUP BY oil
-            ORDER BY cnt DESC
-            LIMIT 5
-        """)
-        top = c.fetchall()  # [(oil, cnt), ...]
-
-        return {
-            "total": total,
-            "last7": last7,
-            "uniq_users": uniq_users,
-            "top": top,
-        }
-    finally:
-        conn.close()
 
 def fetch_orders_page(page: int, page_size: int = 10):
     """Постраничная выборка. Возвращает (rows, total)."""
@@ -284,6 +249,57 @@ async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kw
     return None
 
 
+# --- мини-хелпер: показать «печатает…» ---
+async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        return
+    if seconds > 0:
+        import asyncio
+        await asyncio.sleep(seconds)
+
+
+# ---------- СТАТИСТИКА ----------
+def fetch_stats():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        # всего заявок
+        c.execute("SELECT COUNT(*) FROM orders")
+        total = c.fetchone()[0] or 0
+
+        # за 7 дней
+        c.execute("""
+            SELECT COUNT(*) FROM orders
+            WHERE created_at >= datetime('now','-7 days')
+        """)
+        last7 = c.fetchone()[0] or 0
+
+        # уникальные пользователи
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM orders")
+        uniq_users = c.fetchone()[0] or 0
+
+        # топ-5 товаров
+        c.execute("""
+            SELECT oil, COUNT(*) as cnt
+            FROM orders
+            GROUP BY oil
+            ORDER BY cnt DESC
+            LIMIT 5
+        """)
+        top = c.fetchall()  # [(oil, cnt), ...]
+
+        return {
+            "total": total,
+            "last7": last7,
+            "uniq_users": uniq_users,
+            "top": top,
+        }
+    finally:
+        conn.close()
+
+
 # ---------- КОМАНДЫ ----------
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -308,11 +324,12 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("\n".join(lines))
 
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    is_admin = user_id in ADMIN_IDS  # проверяем, админ ли
+    is_admin_user = user_id in ADMIN_IDS
 
-    # --- базовый текст для всех ---
+    # базовый текст
     text = (
         "Привет! 👋\n"
         "Я бот-магазин масел для электромобилей и гибридов.\n\n"
@@ -320,12 +337,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/catalog — открыть каталог\n"
         "/about — о компании\n"
         "/contacts — контакты\n"
+        "/find <текст> — поиск по каталогу\n"
         "/cancel — отменить оформление заявки\n"
         "/start — показать это сообщение"
     )
 
-    # --- добавляем блок для админов ---
-    if is_admin:
+    # блок для админов
+    if is_admin_user:
         text += (
             "\n\n👑 Команды для админов:\n"
             "/orders [страница] — заявки\n"
@@ -334,33 +352,67 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/stats — статистика"
         )
 
-    # --- добавляем кнопку «Открыть каталог» ---
+    # стартовые кнопки
     keyboard = [
-        [InlineKeyboardButton("🛒 Открыть каталог", callback_data="open_catalog")]
+        [InlineKeyboardButton("🛒 Открыть каталог", callback_data="open_catalog")],
+        [InlineKeyboardButton("🔎 Поиск", callback_data="open_search_hint")],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "ordering" in context.user_data:
-        del context.user_data["ordering"]
-        await safe_reply_text(
-            update.message,
-            "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
-            reply_markup=ReplyKeyboardRemove()    # ⬅ спрятать клавиатуру
-        )
-    else:
-        await safe_reply_text(
-            update.message,
-            "Нечего отменять. Напишите /catalog чтобы открыть каталог.",
-            reply_markup=ReplyKeyboardRemove()    # на всякий случай
-        )
+# --- обработка кнопок из стартового меню ---
+async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "open_catalog":
+        await show_typing(context, query.message.chat.id, 0.5)
+        await show_catalog(update, context)
+    elif query.data == "open_search_hint":
+        await query.message.reply_text("Введите запрос командой:\n/find castrol 1 л")
+
+
+# --- Поиск по каталогу ---
+async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_query = " ".join(context.args).strip().lower() if context.args else ""
+    if not user_query:
+        await update.message.reply_text("Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
+        return
+
+    await show_typing(context, update.effective_chat.id, 0.5)
+
+    results = []
+    for oid, oil in oils.items():
+        blob = " ".join([
+            oil.get("name", ""),
+            oil.get("volume", ""),
+            oil.get("description", ""),
+            " ".join(oil.get("features", [])),
+            oil.get("compatible", "")
+        ]).lower()
+        if all(tok in blob for tok in user_query.split()):
+            results.append((oid, oil))
+
+    if not results:
+        await update.message.reply_text("Ничего не нашлось 🤷\nПопробуйте короче или по-другому.")
+        return
+
+    keyboard = [
+        [InlineKeyboardButton(f"{oil['name']} ({oil['volume']})", callback_data=str(oid))]
+        for oid, oil in results[:10]
+    ]
+    keyboard.append([InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")])
+    await update.message.reply_text(
+        f"Найдено: {len(results)}. Показаны первые {min(len(results),10)}:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 # ---------- КАТАЛОГ / КНОПКИ ----------
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await show_typing(context, update.effective_chat.id, 0.6)
+
     keyboard = [
         [InlineKeyboardButton(f"{oil['name']} ({oil['volume']})", callback_data=str(oil_id))]
         for oil_id, oil in oils.items()
@@ -387,33 +439,30 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
 
-# --- обработка кнопки из стартового меню ---
-async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "open_catalog":
-        await show_catalog(update, context)
 
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = (query.data or "").strip()
+    data = query.data
 
-    # если вдруг прилетело что-то не наше — просто выходим
-    if not (data == "back" or data.startswith("order_") or data.isdigit()):
+    if data == "back":
+        await show_catalog(update, context)
         return
 
+    # Оставить заявку
     if data.startswith("order_"):
         oil_id = int(data.split("_")[1])
         oil = oils[oil_id]
+
+        # ненавязчивый "тост"
+        await query.answer("Ок, оформим заявку. Отправьте контакт 👇", show_alert=False)
+
         text = (
             f"🛒 Вы выбрали:\n"
             f"{oil['name']} ({oil['volume']}) — {oil.get('price', 'цена не указана')} {oil.get('currency', '₽')}\n\n"
             "Отправьте ваш телефон одной кнопкой (рекомендуется) или введите контакт вручную.\n"
             "Можно отменить командой /cancel"
         )
-
-        # Кнопка «Отправить телефон» + фоллбек на текст
         kb = [
             [KeyboardButton("📱 Отправить телефон", request_contact=True)],
             [KeyboardButton("Отмена /cancel")],
@@ -425,11 +474,14 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["ordering"] = oil_id
         return
 
+    # Показ карточки масла
     if data.isdigit():
         oil_id = int(data)
         if oil_id not in oils:
             await safe_reply_text(query.message, "❌ Ошибка: товар не найден.")
             return
+
+        await show_typing(context, update.effective_chat.id, 0.6)
 
         oil = oils[oil_id]
         caption = (
@@ -499,9 +551,10 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = save_order_sql(order)
 
     await update.message.reply_text(
-        f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
-        f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
-        f"Контакты: {contact}",
+        f"✅ Заявка {order_id} создана!\n"
+        f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
+        f"Контакт: {contact}\n"
+        f"⏱️ Время: {datetime.now().strftime('%H:%M:%S')}",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -563,9 +616,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     order_id = save_order_sql(order)
 
     await update.message.reply_text(
-        f"✅ Спасибо! Ваша заявка {order_id} на {oil['name']} ({oil['volume']}) "
-        f"— {oil.get('price', '—')} {oil.get('currency', '₽')} принята.\n"
-        f"Контакты: {contact}",
+        f"✅ Заявка {order_id} создана!\n"
+        f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
+        f"Контакт: {contact}\n"
+        f"⏱️ Время: {datetime.now().strftime('%H:%M:%S')}",
         reply_markup=ReplyKeyboardRemove(),
     )
 
@@ -595,9 +649,8 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
         return
 
-    # ---- извлекаем номер страницы из /orders <n> ИЛИ /orders_<n>
+    # извлекаем страницу из "/orders N" или "/orders_N"
     page = 1
-    # 1) формат: /orders 2
     args = context.args if hasattr(context, "args") else []
     if args:
         try:
@@ -605,7 +658,6 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             page = 1
     else:
-        # 2) формат: /orders_2  (команда без аргументов)
         txt = (update.message.text or "").strip()
         if "_" in txt:
             try:
@@ -637,7 +689,6 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🕒 {created_at}\n"
         )
 
-    # ---- подсказки без пробелов: /orders_2
     hints = []
     if page > 1:
         hints.append(f"/orders_{page-1} ← предыдущая")
@@ -673,7 +724,6 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📭 Заявок пока нет.")
         return
 
-    # пишем CSV в текстовый буфер, затем в BytesIO
     txt = io.StringIO()
     writer = csv.writer(txt)
     writer.writerow(["id","created_at","user_id","username","oil","volume","price","currency","contact"])
@@ -756,11 +806,22 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Telegram: @shaba_v, @andrey_matveev\n"
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
-
+# ---------- CANCEL ----------
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отменяет оформление заявки и убирает клавиатуру."""
+    if "ordering" in context.user_data:
+        del context.user_data["ordering"]
+        await update.message.reply_text(
+            "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(
+            "Нечего отменять. Напишите /catalog чтобы открыть каталог.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 # ---------- Главная ----------
-from telegram.request import HTTPXRequest
-
 def main():
     # подготовим БД + миграция
     init_db()
@@ -769,20 +830,20 @@ def main():
     except Exception as e:
         logger.warning("Миграция пропущена/ошибка: %s", e)
 
-    # ✅ более стабильный httpx-клиент
+    # стабильный httpx-клиент
     request = HTTPXRequest(
         connection_pool_size=20,
-        read_timeout=60,      # ждем ответы дольше
+        read_timeout=60,
         write_timeout=60,
         connect_timeout=15,
         pool_timeout=15,
     )
 
-    # создаем приложение с расширенным клиентом
     app = Application.builder().token(TOKEN).request(request).build()
 
     # --- Команды ---
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("find", find_oil))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("orders", show_orders))
@@ -796,9 +857,9 @@ def main():
     app.add_handler(CommandHandler("exportxlsx", export_xlsx))
 
     # --- Кнопки (callback) ---
-    # СНАЧАЛА спец-кнопка стартового меню:
-    app.add_handler(CallbackQueryHandler(handle_start_button, pattern=r"^open_catalog$"))
-    # Потом карточки каталога: back | order_<id> | <id>
+    # Сначала кнопки стартового меню:
+    app.add_handler(CallbackQueryHandler(handle_start_button, pattern=r"^(open_catalog|open_search_hint)$"))
+    # Затем карточки каталога: back | order_<id> | <id>
     app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
 
     # --- Сообщения ---
@@ -810,11 +871,11 @@ def main():
 
     logger.info("Бот запущен... 🚀")
 
-    # ✅ Увеличены таймауты long-polling
+    # увеличенные таймауты long-polling
     app.run_polling(
-        timeout=60,             # держим соединение до 60 секунд
-        poll_interval=1.5,      # пауза между циклами (уменьшает нагрузку)
-        drop_pending_updates=True,  # сбрасываем старые апдейты при старте
+        timeout=60,
+        poll_interval=1.5,
+        drop_pending_updates=True,
     )
 
 
