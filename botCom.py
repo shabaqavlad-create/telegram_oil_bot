@@ -7,7 +7,9 @@ import re
 import time
 import io
 import csv
+from collections import Counter #для добавления статс
 from datetime import datetime
+
 
 from dotenv import load_dotenv
 from telegram import (
@@ -103,6 +105,43 @@ def save_order_sql(order: dict) -> str:
     finally:
         conn.close()
 
+def fetch_stats():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        c = conn.cursor()
+        # всего заявок
+        c.execute("SELECT COUNT(*) FROM orders")
+        total = c.fetchone()[0] or 0
+
+        # за 7 дней
+        c.execute("""
+            SELECT COUNT(*) FROM orders
+            WHERE created_at >= datetime('now','-7 days')
+        """)
+        last7 = c.fetchone()[0] or 0
+
+        # уникальные пользователи
+        c.execute("SELECT COUNT(DISTINCT user_id) FROM orders")
+        uniq_users = c.fetchone()[0] or 0
+
+        # топ-5 товаров
+        c.execute("""
+            SELECT oil, COUNT(*) as cnt
+            FROM orders
+            GROUP BY oil
+            ORDER BY cnt DESC
+            LIMIT 5
+        """)
+        top = c.fetchall()  # [(oil, cnt), ...]
+
+        return {
+            "total": total,
+            "last7": last7,
+            "uniq_users": uniq_users,
+            "top": top,
+        }
+    finally:
+        conn.close()
 
 def fetch_orders_page(page: int, page_size: int = 10):
     """Постраничная выборка. Возвращает (rows, total)."""
@@ -246,21 +285,62 @@ async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kw
 
 
 # ---------- КОМАНДЫ ----------
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администраторам.")
+        return
+
+    s = fetch_stats()
+    lines = [
+        "📊 Статистика заявок:",
+        f"• Всего: {s['total']}",
+        f"• За 7 дней: {s['last7']}",
+        f"• Уникальных пользователей: {s['uniq_users']}",
+        "",
+        "🏆 Топ-5 товаров:",
+    ]
+    if s["top"]:
+        for oil, cnt in s["top"]:
+            lines.append(f"  — {oil}: {cnt}")
+    else:
+        lines.append("  — пока нет данных")
+
+    await update.message.reply_text("\n".join(lines))
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await safe_reply_text(
-        update.message,
+    user_id = update.effective_user.id
+    is_admin = user_id in ADMIN_IDS  # проверяем, админ ли
+
+    # --- базовый текст для всех ---
+    text = (
         "Привет! 👋\n"
         "Я бот-магазин масел для электромобилей и гибридов.\n\n"
         "📌 Команды:\n"
         "/catalog — открыть каталог\n"
         "/about — о компании\n"
         "/contacts — контакты\n"
-        "/orders [страница] — заявки (для админов)\n"
-        "/exportxlsx — выгрузка заявок в XLSX (для админов)\n"
-        "/exportcsv — выгрузка заявок в CSV (для админов)\n"
         "/cancel — отменить оформление заявки\n"
-        "/start — показать это сообщение",
+        "/start — показать это сообщение"
     )
+
+    # --- добавляем блок для админов ---
+    if is_admin:
+        text += (
+            "\n\n👑 Команды для админов:\n"
+            "/orders [страница] — заявки\n"
+            "/exportxlsx — выгрузка заявок в XLSX\n"
+            "/exportcsv — выгрузка заявок в CSV\n"
+            "/stats — статистика"
+        )
+
+    # --- добавляем кнопку «Открыть каталог» ---
+    keyboard = [
+        [InlineKeyboardButton("🛒 Открыть каталог", callback_data="open_catalog")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -307,14 +387,20 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
 
+# --- обработка кнопки из стартового меню ---
+async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "open_catalog":
+        await show_catalog(update, context)
 
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    data = (query.data or "").strip()
 
-    if data == "back":
-        await show_catalog(update, context)
+    # если вдруг прилетело что-то не наше — просто выходим
+    if not (data == "back" or data.startswith("order_") or data.isdigit()):
         return
 
     if data.startswith("order_"):
@@ -696,6 +782,7 @@ def main():
     app = Application.builder().token(TOKEN).request(request).build()
 
     # --- Команды ---
+    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("orders", show_orders))
@@ -709,7 +796,10 @@ def main():
     app.add_handler(CommandHandler("exportxlsx", export_xlsx))
 
     # --- Кнопки (callback) ---
-    app.add_handler(CallbackQueryHandler(show_oil))
+    # СНАЧАЛА спец-кнопка стартового меню:
+    app.add_handler(CallbackQueryHandler(handle_start_button, pattern=r"^open_catalog$"))
+    # Потом карточки каталога: back | order_<id> | <id>
+    app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
 
     # --- Сообщения ---
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))

@@ -2,7 +2,7 @@
 
 oils = {
     1: {
-        "name": "BYD EHSF-1, EHSF-2LV",
+        "name": "Масло BYD EHSF-1, EHSF-2LV",
         "volume": "3 Л",
         "price": 4400,
         "currency": "₽",
@@ -16,7 +16,7 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114827_931.jpg"
     },
     2: {
-        "name": "BYD EHSF-1, EHSF-2LV",
+        "name": "Масло BYD EHSF-1, EHSF-2LV",
         "volume": "1 Л",
         "price": 1990,
         "currency": "₽",
@@ -44,7 +44,7 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_250.jpg"
     },
     4: {
-        "name": "Масло трансмиссионное FluidMatic LV MV X824 OEM",
+        "name": "Масло FluidMatic LV MV X824 OEM",
         "volume": "1 Л",
         "price": 2400,
         "currency": "₽",
@@ -58,7 +58,7 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_259.jpg"
     },
     5: {
-        "name": "Масло трансмиссионное Castrol D1 OEM",
+        "name": "Масло Castrol D1 OEM",
         "volume": "1 Л",
         "price": 2400,
         "currency": "₽",
@@ -72,7 +72,7 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_331.jpg"
     },
     6: {
-        "name": "Масло трансмиссионное Castrol D2 OEM",
+        "name": "Масло Castrol D2 OEM",
         "volume": "1 Л",
         "price": 2400,
         "currency": "₽",
@@ -86,7 +86,7 @@ oils = {
         "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114828_034.jpg"
     },
     7: {
-        "name": "Масло трансмиссионное Castrol W2",
+        "name": "Масло Castrol W2",
         "volume": "1 Л",
         "price": 2400,
         "currency": "₽",

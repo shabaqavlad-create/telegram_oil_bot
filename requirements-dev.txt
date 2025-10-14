@@ -1,0 +1,6 @@
+-r requirements.txt
+
+black==25.1.0
+pylint==3.3.8
+isort==6.0.1
+astroid==3.3.11
