@@ -32,7 +32,7 @@ from telegram.ext import filters as tg_filters
 from telegram.request import HTTPXRequest
 from openpyxl import Workbook
 
-from catalog import oils  # словарь с маслами
+from catalog import oils  # dict: id -> {name, volume, description, features, compatible, price, currency, image}
 
 # --- Логирование ---
 logging.basicConfig(
@@ -52,8 +52,8 @@ ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()
 
 # --- Пути к данным ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ORDERS_FILE = os.path.join(BASE_DIR, "orders.json")  # на случай миграции
-DB_PATH = os.path.join(BASE_DIR, "orders.db")        # SQLite
+ORDERS_FILE = os.path.join(BASE_DIR, "orders.json")
+DB_PATH = os.path.join(BASE_DIR, "orders.db")
 
 # --- Антиспам ---
 ORDER_COOLDOWN_SEC = 20
@@ -73,7 +73,7 @@ def get_conn():
 
 
 def init_db():
-    """Создаёт таблицу orders и индексы при необходимости."""
+    """Создаёт таблицы и индексы при необходимости."""
     conn = get_conn()
     try:
         c = conn.cursor()
@@ -92,10 +92,19 @@ def init_db():
             )
             """
         )
-        # индексы
         c.execute("CREATE INDEX IF NOT EXISTS idx_orders_created_at ON orders(created_at)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id   ON orders(user_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_orders_oil       ON orders(oil)")
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oil_overrides (
+                oil_id   INTEGER PRIMARY KEY,
+                price    TEXT    NULL,   -- NULL => берём цену из catalog.py
+                stock    INTEGER NULL    -- NULL => безлимит; 0..N => остаток
+            )
+            """
+        )
     finally:
         conn.close()
 
@@ -237,6 +246,68 @@ def validate_contact(text: str) -> tuple[bool, str | None]:
     return True, text.strip()
 
 
+# ---------- OVERRIDES (цена/остаток) ----------
+def get_override(oil_id: int):
+    """Возвращает (price_override:str|None, stock:int|None) для oil_id."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT price, stock FROM oil_overrides WHERE oil_id = ?", (oil_id,))
+        row = c.fetchone()
+        if not row:
+            return None, None
+        return row[0], row[1]
+    finally:
+        conn.close()
+
+
+def upsert_price(oil_id: int, price_text: str | None):
+    """Устанавливает override-цену (или None чтобы сбросить к каталогу)."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO oil_overrides(oil_id, price, stock)
+            VALUES(?, ?, (SELECT stock FROM oil_overrides WHERE oil_id=?))
+            ON CONFLICT(oil_id) DO UPDATE SET price=excluded.price
+            """,
+            (oil_id, price_text, oil_id),
+        )
+    finally:
+        conn.close()
+
+
+def upsert_stock(oil_id: int, stock_value: int | None):
+    """Устанавливает override-остаток (None => безлимит)."""
+    conn = get_conn()
+    try:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO oil_overrides(oil_id, price, stock)
+            VALUES(?, (SELECT price FROM oil_overrides WHERE oil_id=?), ?)
+            ON CONFLICT(oil_id) DO UPDATE SET stock=excluded.stock
+            """,
+            (oil_id, oil_id, stock_value),
+        )
+    finally:
+        conn.close()
+
+
+def get_effective_oil(oil_id: int) -> dict | None:
+    """Возвращает словарь масла с учётом override-цены и stock."""
+    base = oils.get(oil_id)
+    if not base:
+        return None
+    price_ovr, stock_ovr = get_override(oil_id)
+    out = dict(base)  # копия
+    if price_ovr is not None and str(price_ovr).strip() != "":
+        out["price"] = price_ovr
+    out["stock"] = stock_ovr  # None | int
+    return out
+
+
 # ---------- УТИЛИТЫ ----------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -255,21 +326,23 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
-    """Безопасно отвечает: target=Message; если None — пытается по chat_id."""
+    """
+    Безопасно отвечает в тот же чат (target: Message или CallbackQuery.message).
+    """
+    if target is None:
+        logger.warning("safe_reply_text: target=None")
+        return None
     try:
-        if target is not None:
-            return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
+        return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
     except Exception as e:
         logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
         try:
-            if target is not None:
-                return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
+            return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
         except Exception:
             logger.exception("reply_text повторно упал")
     return None
 
 
-# --- мини-хелпер: показать «печатает…» ---
 async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
     try:
         await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -312,8 +385,7 @@ def fetch_stats():
 
 # ---------- КОМАНДЫ ----------
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id not in ADMIN_IDS:
+    if update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
@@ -336,7 +408,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показ версии — только админам."""
     if update.effective_user.id not in ADMIN_IDS:
         return
     path = os.path.join(BASE_DIR, "VERSION")
@@ -367,7 +438,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/exportxlsx — выгрузка заявок в XLSX\n"
             "/exportcsv — выгрузка заявок в CSV\n"
             "/stats — статистика\n"
-            "/version — текущая версия"
+            "/version — текущая версия\n"
+            "/setprice — изменить цену\n"
+            "/setstock — изменить остаток\n"
+            "/stock — сводка остатков"
         )
 
     keyboard = [
@@ -385,7 +459,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
-# --- обработка кнопок из стартового меню ---
+# --- обработка кнопок стартового меню ---
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -403,16 +477,26 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     elif query.data == "open_contacts":
         await contacts(update, context)
 
+    elif query.data == "noop":
+        await query.answer("Нет в наличии — скоро пополним 👋", show_alert=False)
+
 
 # --- Поиск по каталогу ---
+def _norm(s: str) -> str:
+    s = s.lower()
+    s = s.replace("литра", "л").replace("литр", "л").replace("л.", "л")
+    s = re.sub(r"[\s\-\(\)]", "", s)
+    return s
+
 async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_query = " ".join(context.args).strip().lower() if context.args else ""
-    if not user_query:
+    raw = " ".join(context.args) if context.args else ""
+    if not raw.strip():
         await update.message.reply_text("Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
         return
 
     await show_typing(context, update.effective_chat.id, 0.5)
 
+    q_tokens = [_norm(t) for t in raw.split() if t.strip()]
     results = []
     for oid, oil in oils.items():
         blob = " ".join([
@@ -421,8 +505,9 @@ async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             oil.get("description", ""),
             " ".join(oil.get("features", [])),
             oil.get("compatible", "")
-        ]).lower()
-        if all(tok.replace(" ", "") in blob.replace(" ", "") for tok in user_query.split()):
+        ])
+        blob_n = _norm(blob)
+        if all(t in blob_n for t in q_tokens):
             results.append((oid, oil))
 
     if not results:
@@ -442,7 +527,6 @@ async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- КАТАЛОГ / КНОПКИ ----------
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # защита на пустой каталог
     target_msg = update.callback_query.message if update.callback_query else update.message
     if not oils:
         await safe_reply_text(
@@ -489,18 +573,22 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_catalog(update, context)
         return
 
-    # Оставить заявку
     if data.startswith("order_"):
         oil_id = int(data.split("_")[1])
-        oil = oils.get(oil_id)
-        if not oil:
+        eff = get_effective_oil(oil_id)
+        if not eff:
             await query.message.reply_text("Товар больше не доступен. Откройте /catalog и выберите заново.")
+            return
+
+        st = eff.get("stock")
+        if st is not None and st == 0:
+            await query.message.reply_text("К сожалению, товара нет в наличии. Попробуйте выбрать другой.")
             return
 
         await query.answer("Ок, оформим заявку. Отправьте контакт 👇", show_alert=False)
         text = (
             f"🛒 Вы выбрали:\n"
-            f"{oil['name']} ({oil['volume']}) — {oil.get('price', 'цена не указана')} {oil.get('currency', '₽')}\n\n"
+            f"{eff['name']} ({eff['volume']}) — {eff.get('price', 'цена не указана')} {eff.get('currency', '₽')}\n\n"
             "Отправьте ваш телефон одной кнопкой (рекомендуется) или введите контакт вручную.\n"
             "Можно отменить командой /cancel"
         )
@@ -515,30 +603,42 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["ordering"] = oil_id
         return
 
-    # Показ карточки масла
     if data.isdigit():
         oil_id = int(data)
-        oil = oils.get(oil_id)
-        if not oil:
+        eff = get_effective_oil(oil_id)
+        if not eff:
             await safe_reply_text(query.message, "❌ Ошибка: товар не найден.")
             return
 
         await show_typing(context, update.effective_chat.id, 0.6)
 
+        price = eff.get("price", "не указана")
+        currency = eff.get("currency", "₽")
+        stock = eff.get("stock")  # None | int
+        if stock is None:
+            stock_line = "В наличии: есть"
+        elif stock == 0:
+            stock_line = "В наличии: нет"
+        else:
+            stock_line = f"В наличии: {stock} шт."
+
         caption = (
-            f"🔹 <b>{html.escape(oil['name'])}</b> ({html.escape(oil['volume'])})\n\n"
-            f"{html.escape(oil['description'])}\n\n"
-            f"💰 Цена: {html.escape(str(oil.get('price', 'не указана')))} {html.escape(oil.get('currency', '₽'))}\n\n"
+            f"🔹 <b>{html.escape(eff['name'])}</b> ({html.escape(eff['volume'])})\n\n"
+            f"{html.escape(eff['description'])}\n\n"
+            f"💰 Цена: {html.escape(str(price))} {html.escape(currency)}\n"
+            f"📦 {stock_line}\n\n"
             "Характеристики:\n" +
-            "\n".join([f"• {html.escape(f)}" for f in oil["features"]]) +
-            f"\n\nПодходит: {html.escape(oil['compatible'])}"
+            "\n".join([f"• {html.escape(f)}" for f in eff["features"]]) +
+            f"\n\nПодходит: {html.escape(eff['compatible'])}"
         )
-        keyboard = [
-            [InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")],
-            [InlineKeyboardButton("🛒 Оставить заявку", callback_data=f"order_{oil_id}")],
-            [InlineKeyboardButton("📞 Связаться", url="https://t.me/shaba_v")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        buttons = [[InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")]]
+        if stock == 0:
+            buttons.append([InlineKeyboardButton("❌ Нет в наличии", callback_data="noop")])
+        else:
+            buttons.append([InlineKeyboardButton("🛒 Оставить заявку", callback_data=f"order_{oil_id}")])
+        buttons.append([InlineKeyboardButton("📞 Связаться", url="https://t.me/shaba_v")])
+        reply_markup = InlineKeyboardMarkup(buttons)
 
         try:
             await query.delete_message()
@@ -546,28 +646,18 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
         await query.message.reply_photo(
-            photo=oil["image"],
+            photo=eff["image"],
             caption=caption,
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
 
 
-# ---------- ОБРАБОТКА ЗАЯВОК ----------
-async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Путь 1: пользователь нажал «Отправить телефон»."""
-    if "ordering" not in context.user_data:
-        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
-        return
-
+# ---------- ОБЩИЙ ХЕЛПЕР ОФОРМЛЕНИЯ ЗАЯВКИ ----------
+async def _create_order_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE, contact: str):
     user = update.effective_user
-    if not update.message.contact or not update.message.contact.phone_number:
-        await update.message.reply_text("Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
-        return
 
-    contact = update.message.contact.phone_number.strip()
-
-    # Антиспам
+    # антиспам
     now = time.time()
     last = LAST_ORDER_AT.get(user.id)
     if last is not None:
@@ -576,9 +666,13 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
             return
 
+    if "ordering" not in context.user_data:
+        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
+        return
+
     oil_id = context.user_data.get("ordering")
-    oil = oils.get(oil_id)
-    if not oil:
+    eff = get_effective_oil(oil_id)
+    if not eff:
         await update.message.reply_text(
             "Товар больше не доступен. Откройте /catalog и выберите заново.",
             reply_markup=ReplyKeyboardRemove(),
@@ -586,23 +680,33 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("ordering", None)
         return
 
+    st = eff.get("stock")
+    # не списываем остаток — только блокируем, если 0
+    if st is not None and st == 0:
+        await update.message.reply_text(
+            "К сожалению, товара нет в наличии. Попробуйте выбрать другой.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        context.user_data.pop("ordering", None)
+        return
+
     username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
-    logger.info("ORDER by %s (%s): %s %s / %s", user.id, user.username, oil['name'], oil['volume'], contact)
+    logger.info("ORDER by %s (%s): %s %s / %s", user.id, user.username, eff['name'], eff['volume'], contact)
 
     order = {
         "user_id": user.id,
         "username": user.username,
-        "oil": oil["name"],
-        "volume": oil["volume"],
-        "price": oil.get("price", "—"),
-        "currency": oil.get("currency", "₽"),
+        "oil": eff["name"],
+        "volume": eff["volume"],
+        "price": eff.get("price", "—"),
+        "currency": eff.get("currency", "₽"),
         "contact": contact,
     }
     order_id = save_order_sql(order)
 
     await update.message.reply_text(
         f"✅ Заявка {order_id} создана!\n"
-        f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
+        f"Товар: {eff['name']} ({eff['volume']}) — {eff.get('price','—')} {eff.get('currency','₽')}\n"
         f"Контакт: {contact}\n"
         f"⏱️ Время: {datetime.now().strftime('%H:%M:%S')}",
         reply_markup=ReplyKeyboardRemove(),
@@ -614,8 +718,8 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=admin_id,
                 text=(
                     f"📩 Новая заявка {order_id}\n\n"
-                    f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
-                    f"💰 Цена: {oil.get('price', '—')} {oil.get('currency', '₽')}\n"
+                    f"🛒 Товар: {eff['name']} ({eff['volume']})\n"
+                    f"💰 Цена: {eff.get('price', '—')} {eff.get('currency', '₽')}\n"
                     f"👤 От: {username_visible}\n"
                     f"📞 Контакты: {contact}"
                 ),
@@ -625,180 +729,114 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     LAST_ORDER_AT[user.id] = now
     context.user_data.pop("ordering", None)
+
+
+# ---------- ОБРАБОТКА ЗАЯВОК ----------
+async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Путь 1: пользователь нажал «Отправить телефон»."""
+    if not update.message.contact or not update.message.contact.phone_number:
+        await update.message.reply_text("Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
+        return
+    await _create_order_for_user(update, context, update.message.contact.phone_number.strip())
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Путь 2: пользователь ввёл контакт текстом."""
-    user = update.effective_user
-    text = update.message.text
-
-    if "ordering" not in context.user_data:
-        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
-        return
-
-    ok, norm = validate_contact(text)
+    ok, norm = validate_contact(update.message.text)
     if not ok:
         await update.message.reply_text(norm)
         return
-    contact = norm
-
-    now = time.time()
-    last = LAST_ORDER_AT.get(user.id)
-    if last is not None:
-        remain = ORDER_COOLDOWN_SEC - int(now - last)
-        if remain > 0:
-            await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
-            return
-
-    oil_id = context.user_data.get("ordering")
-    oil = oils.get(oil_id)
-    if not oil:
-        await update.message.reply_text(
-            "Товар больше не доступен. Откройте /catalog и выберите заново.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        context.user_data.pop("ordering", None)
-        return
-
-    username_visible = f"@{user.username}" if user.username else f"ID:{user.id}"
-    logger.info("ORDER by %s (%s): %s %s / %s", user.id, user.username, oil['name'], oil['volume'], contact)
-
-    order = {
-        "user_id": user.id,
-        "username": user.username,
-        "oil": oil["name"],
-        "volume": oil["volume"],
-        "price": oil.get("price", "—"),
-        "currency": oil.get("currency", "₽"),
-        "contact": contact,
-    }
-    order_id = save_order_sql(order)
-
-    await update.message.reply_text(
-        f"✅ Заявка {order_id} создана!\n"
-        f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
-        f"Контакт: {contact}\n"
-        f"⏱️ Время: {datetime.now().strftime('%H:%M:%S')}",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    f"📩 Новая заявка {order_id}\n\n"
-                    f"🛒 Товар: {oil['name']} ({oil['volume']})\n"
-                    f"💰 Цена: {oil.get('price', '—')} {oil.get('currency', '₽')}\n"
-                    f"👤 От: {username_visible}\n"
-                    f"📞 Контакты: {contact}"
-                ),
-            )
-        except Exception as e:
-            logger.warning(f"Не удалось отправить админу {admin_id}: {e}")
-
-    LAST_ORDER_AT[user.id] = now
-    context.user_data.pop("ordering", None)
+    await _create_order_for_user(update, context, norm)
 
 
-# ---------- /orders (только админы) с пагинацией + кнопки ----------
-async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Работает и как /orders [n] (или /orders_n), и как callback 'orders_page_n'."""
-    # --- проверка админа ---
+# ---------- /orders (только админы) с пагинацией ----------
+
+async def _render_orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int):
+    """Рендерит список заявок с инлайн-кнопками пагинации.
+       Работает как из команды /orders, так и из callback-кнопок."""
     user = update.effective_user
-    if user is None or user.id not in ADMIN_IDS:
-        # Если это колбэк — вежливо отклоняем
-        if update.callback_query:
-            try:
-                await update.callback_query.answer("Недостаточно прав.", show_alert=True)
-            except Exception:
-                pass
+    if user.id not in ADMIN_IDS:
+        # безопасно игнорируем не-админа
+        if getattr(update, "callback_query", None):
+            await update.callback_query.answer("Нет доступа", show_alert=False)
         else:
-            await safe_reply_text(update.message, "⛔ У вас нет доступа.")
+            await safe_reply_text(update.message, f"⛔ У вас нет доступа. Ваш ID: {user.id}")
         return
-
-    # --- определить страницу ---
-    page = 1
-    if update.callback_query:
-        # колбэк вида orders_page_3
-        data = update.callback_query.data or ""
-        try:
-            page = int(data.rsplit("_", 1)[1])
-        except Exception:
-            page = 1
-    else:
-        # команда: /orders 2 или /orders_2
-        args = context.args if hasattr(context, "args") else []
-        if args:
-            try:
-                page = int(args[0])
-            except ValueError:
-                page = 1
-        else:
-            txt = (update.message.text or "").strip()
-            if "_" in txt:
-                try:
-                    page = int(txt.split("_", 1)[1])
-                except ValueError:
-                    page = 1
 
     page = max(1, page)
     page_size = 10
-
     rows, total = fetch_orders_page(page=page, page_size=page_size)
+
     if total == 0:
-        # пусто
-        if update.callback_query:
-            await update.callback_query.edit_message_text("📭 Заявок пока нет.")
-        else:
-            await safe_reply_text(update.message, "📭 Заявок пока нет.")
-        return
-
-    total_pages = (total + page_size - 1) // page_size
-    if not rows:
-        text = f"Страница {page}/{total_pages} пуста."
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text)
-        else:
-            await safe_reply_text(update.message, text)
-        return
-
-    # --- текст заявок ---
-    lines = [f"📋 Список заявок — стр. {page}/{total_pages}\n"]
-    for (oid, user_id, username, oil, volume, price, currency, contact, created_at) in rows:
-        username_visible = f"@{username}" if username else f"ID:{user_id}"
-        lines.append(
-            f"#{oid:03} — {oil} ({volume})\n"
-            f"💰 Цена: {price or '—'} {currency or '₽'}\n"
-            f"👤 От: {username_visible}\n"
-            f"📞 Контакты: {contact}\n"
-            f"🕒 {created_at}\n"
-        )
-    text = "\n".join(lines)
-
-    # --- кнопки пагинации ---
-    buttons = []
-    if page > 1:
-        buttons.append(InlineKeyboardButton("⬅️ Предыдущая", callback_data=f"orders_page_{page-1}"))
-    if page < total_pages:
-        buttons.append(InlineKeyboardButton("Следующая ➡️", callback_data=f"orders_page_{page+1}"))
-    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
-
-    # --- отправка / редактирование ---
-    if update.callback_query:
-        try:
-            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-        except Exception:
-            # на случай если редактирование невозможно (например «message is not modified»)
-            await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+        text = "📭 Заявок пока нет."
+        markup = None
     else:
-        await safe_reply_text(update.message, text, reply_markup=reply_markup)
+        total_pages = (total + page_size - 1) // page_size
+        # если вылезли за пределы — нормализуем
+        if page > total_pages:
+            page = total_pages
+            rows, total = fetch_orders_page(page=page, page_size=page_size)
+
+        lines = [f"📋 Список заявок — стр. {page}/{total_pages}\n"]
+        for (oid, user_id, username, oil, volume, price, currency, contact, created_at) in rows:
+            username_visible = f"@{username}" if username else f"ID:{user_id}"
+            lines.append(
+                f"#{oid:03} — {oil} ({volume})\n"
+                f"💰 Цена: {price or '—'} {currency or '₽'}\n"
+                f"👤 От: {username_visible}\n"
+                f"📞 Контакты: {contact}\n"
+                f"🕒 {created_at}\n"
+            )
+        text = "\n".join(lines)
+
+        # инлайн-кнопки пагинации
+        buttons = []
+        row = []
+        if page > 1:
+            row.append(InlineKeyboardButton("⬅ Назад", callback_data=f"orders_page_{page-1}"))
+        if page < total_pages:
+            row.append(InlineKeyboardButton("Вперёд ➡", callback_data=f"orders_page_{page+1}"))
+        if row:
+            buttons.append(row)
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+
+    if getattr(update, "callback_query", None):
+        q = update.callback_query
+        try:
+            await q.answer()
+        except Exception:
+            pass
+        # пробуем редактировать, если не получится — отправим новое сообщение
+        try:
+            await q.edit_message_text(text=text, reply_markup=markup)
+        except Exception:
+            await safe_reply_text(q.message, text, reply_markup=markup)
+    else:
+        await safe_reply_text(update.message, text, reply_markup=markup)
+
+async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # извлекаем страницу из "/orders N" или "/orders_N"
+    page = 1
+    args = context.args if hasattr(context, "args") else []
+    if args:
+        try:
+            page = int(args[0])
+        except ValueError:
+            page = 1
+    else:
+        txt = (update.message.text or "").strip()
+        if "_" in txt:
+            try:
+                page = int(txt.split("_", 1)[1])
+            except ValueError:
+                page = 1
+
+    await _render_orders_page(update, context, page)
 
 
 # ---------- ЭКСПОРТЫ (только админы) ----------
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
@@ -825,8 +863,7 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
     writer.writerow(["id","created_at","user_id","username","oil","volume","price","currency","contact"])
     writer.writerows(rows)
 
-    # добавляем UTF-8 BOM, чтобы Excel корректно открыл кириллицу
-    bio = io.BytesIO(("\ufeff" + txt.getvalue()).encode("utf-8"))
+    bio = io.BytesIO(("\ufeff" + txt.getvalue()).encode("utf-8"))  # UTF-8 BOM для Excel
     bio.seek(0)
 
     filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
@@ -839,8 +876,7 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not is_admin(user.id):
+    if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
@@ -890,7 +926,6 @@ async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- О нас / Контакты ----------
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ответить туда, откуда пришёл апдейт (callback или /about)
     target_msg = update.callback_query.message if update.callback_query else update.message
     await safe_reply_text(
         target_msg,
@@ -902,12 +937,11 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ответить туда, откуда пришёл апдейт (callback или /contacts)
     target_msg = update.callback_query.message if update.callback_query else update.message
     await safe_reply_text(
         target_msg,
         "📞 Наши контакты:\n\n"
-        "Телефон: +7 (999) 559-39-17 - Андрей, +7 (953) 046-36-54 - Влад\n"
+        "Телефон: +7 (999) 559-39-17 — Андрей, +7 (953) 046-36-54 — Влад\n"
         "Telegram: @shaba_v, @andrey_matveev\n"
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
@@ -915,7 +949,6 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- CANCEL ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отменяет оформление заявки и убирает клавиатуру."""
     if "ordering" in context.user_data:
         context.user_data.pop("ordering", None)
         await update.message.reply_text(
@@ -931,7 +964,85 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- UNKNOWN COMMAND ----------
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Я не знаю эту команду. Попробуйте /start или /catalog.")
+    await update.message.reply_text("Я не знаю эту команду. Попробуйте /start или откройте каталог кнопкой.")
+
+
+# ---------- ADMIN: SETPRICE / SETSTOCK / STOCK ----------
+async def setprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /setprice <oil_id> <цена|reset>\nПримеры: /setprice 3 1990  |  /setprice 3 reset")
+        return
+    try:
+        oil_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("oil_id должен быть числом.")
+        return
+    if oil_id not in oils:
+        await update.message.reply_text("Товар с таким id не найден в catalog.py")
+        return
+
+    price_arg = " ".join(context.args[1:]).strip()
+    if price_arg.lower() in ("reset", "none", "null", "-"):
+        upsert_price(oil_id, None)
+        await update.message.reply_text(f"✅ Цена для {oils[oil_id]['name']} сброшена к каталогу.")
+    else:
+        upsert_price(oil_id, price_arg)
+        await update.message.reply_text(f"✅ Цена для {oils[oil_id]['name']} установлена: {price_arg}")
+
+
+async def setstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Использование: /setstock <oil_id> <кол-во|inf|reset>\nПримеры: /setstock 3 15  |  /setstock 3 inf")
+        return
+    try:
+        oil_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("oil_id должен быть числом.")
+        return
+    if oil_id not in oils:
+        await update.message.reply_text("Товар с таким id не найден в catalog.py")
+        return
+
+    qty_arg = context.args[1].strip().lower()
+    if qty_arg in ("inf", "reset", "none", "null", "-1"):
+        upsert_stock(oil_id, None)  # безлимит
+        await update.message.reply_text(f"✅ Остаток для {oils[oil_id]['name']} установлен как безлимит.")
+    else:
+        try:
+            qty = int(qty_arg)
+            if qty < 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("Количество должно быть целым числом ≥ 0 или 'inf' для безлимита.")
+            return
+        upsert_stock(oil_id, qty)
+        await update.message.reply_text(f"✅ Остаток для {oils[oil_id]['name']} установлен: {qty}")
+
+
+async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сводка остатков по всем позициям (для админов)."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+
+    lines = ["📦 Остатки:"]
+    for oid, base in oils.items():
+        eff = get_effective_oil(oid) or base
+        stock = eff.get("stock")
+        stock_text = "∞" if stock is None else str(stock)
+
+        price_text = eff.get("price", base.get("price", "—"))
+        currency   = eff.get("currency", base.get("currency", "₽"))
+
+        price_str = str(price_text)
+        if currency and currency not in price_str:
+            price_str = f"{price_str} {currency}"
+
+        lines.append(f"{oid:>2}: {base['name']} — остаток: {stock_text}; цена: {price_str}")
+    await update.message.reply_text("\n".join(lines))
 
 
 # ---------- Главная ----------
@@ -957,7 +1068,7 @@ def main():
     # фильтр "только админам"
     admin_filter = tg_filters.User(user_id=ADMIN_IDS)
 
-    # --- Команды ---
+    # --- Команды (пользовательские) ---
     app.add_handler(CommandHandler("find", find_oil))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("catalog", show_catalog))
@@ -965,7 +1076,7 @@ def main():
     app.add_handler(CommandHandler("contacts", contacts))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Админские
+    # --- Команды (админские) ---
     app.add_handler(CommandHandler("orders", show_orders, filters=admin_filter))
     app.add_handler(MessageHandler(tg_filters.Regex(r"^/orders_\d+$") & admin_filter, show_orders))
     app.add_handler(CommandHandler("exportcsv", export_csv, filters=admin_filter))
@@ -973,29 +1084,29 @@ def main():
     app.add_handler(CommandHandler("exportxlsx", export_xlsx, filters=admin_filter))
     app.add_handler(CommandHandler("stats", stats, filters=admin_filter))
     app.add_handler(CommandHandler("version", version_cmd, filters=admin_filter))
+    app.add_handler(CommandHandler("setprice", setprice_cmd, filters=admin_filter))
+    app.add_handler(CommandHandler("setstock", setstock_cmd, filters=admin_filter))
+    app.add_handler(CommandHandler("stock", stock_cmd, filters=admin_filter))
 
     # --- Кнопки (callback) ---
     app.add_handler(CallbackQueryHandler(
         handle_start_button,
-        pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts)$"
+        pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts|noop)$"
     ))
-    # Пагинация заявок (кнопки «Назад/Вперёд»)
-    app.add_handler(CallbackQueryHandler(show_orders, pattern=r"^orders_page_\d+$"))
     # Карточки каталога: back | order_<id> | <id>
     app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
-
+    app.add_handler(CallbackQueryHandler(lambda u, c: _render_orders_page(u, c, int(u.callback_query.data.split("_")[-1])),
+                                     pattern=r"^orders_page_\d+$"))
     # --- Сообщения ---
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    # Unknown command — в самом конце
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))  # в конце
 
     # --- Ошибки ---
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
 
-    # увеличенные таймауты long-polling
     app.run_polling(
         timeout=60,
         poll_interval=1.5,
