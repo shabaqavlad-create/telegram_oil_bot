@@ -9,7 +9,7 @@ import io
 import csv
 import html
 from datetime import datetime
-
+from telegram import BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from dotenv import load_dotenv
 from telegram import (
     Update,
@@ -454,8 +454,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔎 Поиск", callback_data="open_search_hint"),
         ],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
 
+    # ✅ Админ-ряд кнопок
+    if is_admin_user:
+        keyboard.append([
+            InlineKeyboardButton("✏️ Изменить цену", callback_data="admin_setprice_help"),
+            InlineKeyboardButton("📦 Изменить остаток", callback_data="admin_setstock_help"),
+        ])
+        keyboard.append([
+            InlineKeyboardButton("📋 Остатки", callback_data="admin_stock_summary"),
+        ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
@@ -463,6 +473,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    uid = update.effective_user.id
+    is_admin_user = uid in ADMIN_IDS
 
     if query.data == "open_catalog":
         await show_typing(context, query.message.chat.id, 0.5)
@@ -478,7 +490,46 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await contacts(update, context)
 
     elif query.data == "noop":
-        await query.answer("Нет в наличии — скоро пополним 👋", show_alert=False)
+        await query.answer("Нет в наличии", show_alert=False)
+
+    # ---------- АДМИН-КНОПКИ ----------
+    elif query.data == "admin_setprice_help":
+        if not is_admin_user:
+            await query.answer("Только для админов", show_alert=True)
+            return
+        # небольшая подсказка + топ-10 ID для удобства
+        ids_preview = "\n".join([f"{oid}: {oil['name']}" for oid, oil in list(oils.items())[:10]])
+        await query.message.reply_text(
+            "✏️ Как изменить цену:\n"
+            "• /setprice <oil_id> <цена>\n"
+            "• чтобы сбросить к каталогу: /setprice <oil_id> reset\n\n"
+            "Примеры:\n"
+            "• /setprice 3 1990\n"
+            "• /setprice 3 reset\n\n"
+            "Первые позиции (id:name):\n" + (ids_preview if ids_preview else "—")
+        )
+
+    elif query.data == "admin_setstock_help":
+        if not is_admin_user:
+            await query.answer("Только для админов", show_alert=True)
+            return
+        ids_preview = "\n".join([f"{oid}: {oil['name']}" for oid, oil in list(oils.items())[:10]])
+        await query.message.reply_text(
+            "📦 Как изменить остаток:\n"
+            "• /setstock <oil_id> <кол-во>\n"
+            "• безлимит: /setstock <oil_id> inf (или reset)\n\n"
+            "Примеры:\n"
+            "• /setstock 3 15\n"
+            "• /setstock 3 inf\n\n"
+            "Первые позиции (id:name):\n" + (ids_preview if ids_preview else "—")
+        )
+
+    elif query.data == "admin_stock_summary":
+        if not is_admin_user:
+            await query.answer("Только для админов", show_alert=True)
+            return
+        # просто вызываем сводку, но убедимся, что она умеет отвечать в callback-чате
+        await stock_cmd(update, context)
 
 
 # --- Поиск по каталогу ---
@@ -814,17 +865,24 @@ async def _render_orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     else:
         await safe_reply_text(update.message, text, reply_markup=markup)
 
+async def orders_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        page = int(update.callback_query.data.split("_")[-1])
+    except Exception:
+        page = 1
+    await _render_orders_page(update, context, page)
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # извлекаем страницу из "/orders N" или "/orders_N"
+    """Команда /orders [page] и алиас /orders_N — рендер страницы заявок."""
     page = 1
-    args = context.args if hasattr(context, "args") else []
-    if args:
+    # /orders 3
+    if context.args:
         try:
-            page = int(args[0])
+            page = int(context.args[0])
         except ValueError:
             page = 1
     else:
-        txt = (update.message.text or "").strip()
+        # /orders_3
+        txt = (update.message.text or "").strip() if update.message else ""
         if "_" in txt:
             try:
                 page = int(txt.split("_", 1)[1])
@@ -832,7 +890,6 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 page = 1
 
     await _render_orders_page(update, context, page)
-
 
 # ---------- ЭКСПОРТЫ (только админы) ----------
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1024,26 +1081,54 @@ async def setstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def stock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сводка остатков по всем позициям (для админов)."""
+    """Сводка остатков по всем позициям (для админов). Работает и из callback, и из /stock."""
     if update.effective_user.id not in ADMIN_IDS:
         return
 
+    target_msg = update.callback_query.message if update.callback_query else update.message
+
     lines = ["📦 Остатки:"]
     for oid, base in oils.items():
-        eff = get_effective_oil(oid) or base
-        stock = eff.get("stock")
+        eff = get_effective_oil(oid)
+        stock = eff.get("stock") if eff else None
         stock_text = "∞" if stock is None else str(stock)
+        price_text = eff.get("price") if eff else base.get("price")
+        lines.append(f"{oid:>2}: {base['name']} — остаток: {stock_text}; цена: {price_text} {base.get('currency','₽')}")
 
-        price_text = eff.get("price", base.get("price", "—"))
-        currency   = eff.get("currency", base.get("currency", "₽"))
+    await safe_reply_text(target_msg, "\n".join(lines))
 
-        price_str = str(price_text)
-        if currency and currency not in price_str:
-            price_str = f"{price_str} {currency}"
+async def set_bot_commands(application):
+    """Заполняет кнопку 'Меню' (команды) по-разному: всем и отдельно админам."""
+    base_commands = [
+        BotCommand("start", "Показать меню"),
+        BotCommand("catalog", "Открыть каталог"),
+        BotCommand("find", "Поиск по каталогу"),
+        BotCommand("about", "О компании"),
+        BotCommand("contacts", "Контакты"),
+        BotCommand("cancel", "Отменить оформление заявки"),
+    ]
 
-        lines.append(f"{oid:>2}: {base['name']} — остаток: {stock_text}; цена: {price_str}")
-    await update.message.reply_text("\n".join(lines))
+    admin_only = [
+        BotCommand("orders", "Просмотр заявок"),
+        BotCommand("exportxlsx", "Экспорт XLSX"),
+        BotCommand("exportcsv", "Экспорт CSV"),
+        BotCommand("stats", "Статистика"),
+        BotCommand("version", "Версия бота"),
+        BotCommand("setprice", "Изменить цену"),
+        BotCommand("setstock", "Изменить остаток"),
+        BotCommand("stock", "Сводка остатков"),
+    ]
 
+    # 1) Команды по умолчанию — увидят все в любом чате
+    await application.bot.set_my_commands(base_commands, scope=BotCommandScopeDefault())
+
+    # 2) Для каждого админа — расширенный набор в ЛС с ботом
+    for admin_id in ADMIN_IDS:
+        try:
+            await application.bot.set_my_commands(base_commands + admin_only,
+                                                 scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning("Не удалось установить команды для админа %s: %s", admin_id, e)
 
 # ---------- Главная ----------
 def main():
@@ -1054,7 +1139,7 @@ def main():
     except Exception as e:
         logger.warning("Миграция пропущена/ошибка: %s", e)
 
-    # стабильный httpx-клиент
+    # httpx-клиент
     request = HTTPXRequest(
         connection_pool_size=20,
         read_timeout=60,
@@ -1063,7 +1148,18 @@ def main():
         pool_timeout=15,
     )
 
-    app = Application.builder().token(TOKEN).request(request).build()
+    # post_init для установки меню-команд
+    async def _post_init(app: Application):
+        await set_bot_commands(app)
+
+    app = (
+        Application
+        .builder()
+        .token(TOKEN)
+        .request(request)
+        .post_init(_post_init)   # <-- Вот так правильно
+        .build()
+    )
 
     # фильтр "только админам"
     admin_filter = tg_filters.User(user_id=ADMIN_IDS)
@@ -1091,28 +1187,27 @@ def main():
     # --- Кнопки (callback) ---
     app.add_handler(CallbackQueryHandler(
         handle_start_button,
-        pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts|noop)$"
+        pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts|noop|admin_setprice_help|admin_setstock_help|admin_stock_summary)$"
     ))
-    # Карточки каталога: back | order_<id> | <id>
     app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
-    app.add_handler(CallbackQueryHandler(lambda u, c: _render_orders_page(u, c, int(u.callback_query.data.split("_")[-1])),
-                                     pattern=r"^orders_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(orders_page_cb, pattern=r"^orders_page_\d+$"))
+
     # --- Сообщения ---
     app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))  # в конце
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))  # в самом конце
 
     # --- Ошибки ---
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
 
+    # Запуск
     app.run_polling(
         timeout=60,
         poll_interval=1.5,
         drop_pending_updates=True,
     )
-
 
 if __name__ == "__main__":
     main()
