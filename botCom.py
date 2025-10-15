@@ -1,5 +1,3 @@
-# bot.py
-
 # --- Импорты ---
 import os
 import json
@@ -20,9 +18,6 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    BotCommand,
-    BotCommandScopeDefault,
-    BotCommandScopeChat,
 )
 from telegram.constants import ChatAction
 from telegram.ext import (
@@ -31,8 +26,9 @@ from telegram.ext import (
     ContextTypes,
     CallbackQueryHandler,
     MessageHandler,
+    filters,
 )
-from telegram.ext import filters as F
+from telegram.ext import filters as tg_filters
 from telegram.request import HTTPXRequest
 from openpyxl import Workbook
 
@@ -53,8 +49,6 @@ if not TOKEN:
 
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
-if not ADMIN_IDS:
-    logger.warning("ADMIN_IDS пуст — админские команды будут недоступны ни для кого.")
 
 # --- Пути к данным ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -65,58 +59,8 @@ DB_PATH = os.path.join(BASE_DIR, "orders.db")        # SQLite
 ORDER_COOLDOWN_SEC = 20
 LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней УСПЕШНОЙ заявки
 
-# --- Константы UI ---
-CAPTION_LIMIT = 1024  # безопасный лимит подписи к фото
-
-
-# ---------- УТИЛИТЫ (общие) ----------
-
-def truncate(s: str, limit: int = CAPTION_LIMIT) -> str:
-    return s if len(s) <= limit else s[:limit - 1] + "…"
-
-
-def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
-
-
-def target_message(update: Update):
-    """Возвращает сообщение, в которое безопасно отвечать (callback или обычное)."""
-    return update.callback_query.message if update.callback_query else update.message
-
-
-async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
-    """Безопасный reply_text с fallback без parse_mode."""
-    try:
-        return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
-    except Exception as e:
-        logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
-        try:
-            return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
-        except Exception:
-            logger.exception("reply_text повторно упал")
-    return None
-
-
-async def reply_to_update(update: Update, text: str, **kwargs):
-    """Безопасно ответить в тот же контекст, откуда пришёл апдейт (callback/сообщение)."""
-    msg = target_message(update)
-    if msg:
-        return await safe_reply_text(msg, text, **kwargs)
-
-
-async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
-    """Ненавязчивый индикатор 'печатает…'."""
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    except Exception:
-        return
-    if seconds > 0:
-        import asyncio
-        await asyncio.sleep(seconds)
-
 
 # ---------- БАЗА ДАННЫХ (SQLite) ----------
-
 def get_conn():
     """Единая точка подключения: WAL, busy_timeout, FK и др."""
     conn = sqlite3.connect(DB_PATH, timeout=15, isolation_level=None)  # autocommit
@@ -268,7 +212,6 @@ def migrate_json_to_sql():
 
 
 # ---------- ВАЛИДАЦИЯ КОНТАКТА ----------
-
 PHONE_RE = re.compile(
     r"""^\s*
         (?:
@@ -294,7 +237,11 @@ def validate_contact(text: str) -> tuple[bool, str | None]:
     return True, text.strip()
 
 
-# ---------- Ошибки ----------
+# ---------- УТИЛИТЫ ----------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
     for admin_id in ADMIN_IDS:
@@ -307,8 +254,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             logger.debug("Не удалось уведомить админа %s", admin_id)
 
 
-# ---------- СТАТИСТИКА / АДМИН ----------
+async def safe_reply_text(target, text: str, parse_mode: str | None = None, **kwargs):
+    """Безопасно отвечает: target=Message; если None — пытается по chat_id."""
+    try:
+        if target is not None:
+            return await target.reply_text(text, parse_mode=parse_mode, **kwargs)
+    except Exception as e:
+        logger.warning("reply_text упал (%s). Пробуем без parse_mode…", e)
+        try:
+            if target is not None:
+                return await target.reply_text(text, **{k: v for k, v in kwargs.items() if k != "parse_mode"})
+        except Exception:
+            logger.exception("reply_text повторно упал")
+    return None
 
+
+# --- мини-хелпер: показать «печатает…» ---
+async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds: float = 0.8):
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    except Exception:
+        return
+    if seconds > 0:
+        import asyncio
+        await asyncio.sleep(seconds)
+
+
+# ---------- СТАТИСТИКА ----------
 def fetch_stats():
     conn = get_conn()
     try:
@@ -338,9 +310,11 @@ def fetch_stats():
         conn.close()
 
 
+# ---------- КОМАНДЫ ----------
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
     s = fetch_stats()
@@ -358,7 +332,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("  — пока нет данных")
 
-    await reply_to_update(update, "\n".join(lines))
+    await update.message.reply_text("\n".join(lines))
 
 
 async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -368,12 +342,10 @@ async def version_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = os.path.join(BASE_DIR, "VERSION")
     try:
         with open(path, "r", encoding="utf-8") as f:
-            await reply_to_update(update, f"Версия: {f.read().strip()}")
+            await update.message.reply_text(f"Версия: {f.read().strip()}")
     except FileNotFoundError:
-        await reply_to_update(update, "VERSION не найден.")
+        await update.message.reply_text("VERSION не найден.")
 
-
-# ---------- START / Меню ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -408,9 +380,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton("🔎 Поиск", callback_data="open_search_hint"),
         ],
     ]
-    await reply_to_update(update, text, reply_markup=InlineKeyboardMarkup(keyboard))
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
+# --- обработка кнопок из стартового меню ---
 async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -420,7 +395,7 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await show_catalog(update, context)
 
     elif query.data == "open_search_hint":
-        await reply_to_update(update, "Введите запрос командой:\n/find castrol 1 л")
+        await query.message.reply_text("Введите запрос командой:\n/find castrol 1 л")
 
     elif query.data == "open_about":
         await about(update, context)
@@ -429,34 +404,29 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
         await contacts(update, context)
 
 
-# ---------- Поиск ----------
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", s.lower()).strip()
-
+# --- Поиск по каталогу ---
 async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_query = norm(" ".join(context.args)) if context.args else ""
+    user_query = " ".join(context.args).strip().lower() if context.args else ""
     if not user_query:
-        await reply_to_update(update, "Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
+        await update.message.reply_text("Использование: /find текст_поиска\nНапр.: /find castrol 1 л")
         return
 
     await show_typing(context, update.effective_chat.id, 0.5)
 
     results = []
     for oid, oil in oils.items():
-        blob = norm(" ".join([
+        blob = " ".join([
             oil.get("name", ""),
             oil.get("volume", ""),
             oil.get("description", ""),
             " ".join(oil.get("features", [])),
-            oil.get("compatible", ""),
-        ]))
-        # терпим к пробелам/регистру
+            oil.get("compatible", "")
+        ]).lower()
         if all(tok.replace(" ", "") in blob.replace(" ", "") for tok in user_query.split()):
             results.append((oid, oil))
 
     if not results:
-        await reply_to_update(update, "Ничего не нашлось 🤷\nПопробуйте короче или по-другому.")
+        await update.message.reply_text("Ничего не нашлось 🤷\nПопробуйте короче или по-другому.")
         return
 
     keyboard = [
@@ -464,19 +434,21 @@ async def find_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for oid, oil in results[:10]
     ]
     keyboard.append([InlineKeyboardButton("⬅ Назад в каталог", callback_data="back")])
-    await reply_to_update(
-        update,
+    await update.message.reply_text(
         f"Найдено: {len(results)}. Показаны первые {min(len(results),10)}:",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
 
-# ---------- Каталог ----------
-
+# ---------- КАТАЛОГ / КНОПКИ ----------
 async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # защита на пустой каталог
+    target_msg = update.callback_query.message if update.callback_query else update.message
     if not oils:
-        await reply_to_update(update, "Каталог временно пуст. Попробуйте позже или напишите нам: @shaba_v")
+        await safe_reply_text(
+            target_msg,
+            "Каталог временно пуст. Попробуйте позже или напишите нам: @shaba_v"
+        )
         return
 
     await show_typing(context, update.effective_chat.id, 0.6)
@@ -505,7 +477,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await safe_reply_text(query.message, "Выберите масло:", reply_markup=reply_markup)
     else:
-        await reply_to_update(update, "Выберите масло:", reply_markup=reply_markup)
+        await safe_reply_text(update.message, "Выберите масло:", reply_markup=reply_markup)
 
 
 async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -522,7 +494,7 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         oil_id = int(data.split("_")[1])
         oil = oils.get(oil_id)
         if not oil:
-            await reply_to_update(update, "Товар больше не доступен. Откройте /catalog и выберите заново.")
+            await query.message.reply_text("Товар больше не доступен. Откройте /catalog и выберите заново.")
             return
 
         await query.answer("Ок, оформим заявку. Отправьте контакт 👇", show_alert=False)
@@ -548,7 +520,7 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         oil_id = int(data)
         oil = oils.get(oil_id)
         if not oil:
-            await reply_to_update(update, "❌ Ошибка: товар не найден.")
+            await safe_reply_text(query.message, "❌ Ошибка: товар не найден.")
             return
 
         await show_typing(context, update.effective_chat.id, 0.6)
@@ -575,23 +547,22 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.message.reply_photo(
             photo=oil["image"],
-            caption=truncate(caption),
+            caption=caption,
             parse_mode="HTML",
             reply_markup=reply_markup,
         )
 
 
 # ---------- ОБРАБОТКА ЗАЯВОК ----------
-
 async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Путь 1: пользователь нажал «Отправить телефон»."""
     if "ordering" not in context.user_data:
-        await reply_to_update(update, "Используйте /catalog чтобы выбрать масло.")
+        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
         return
 
     user = update.effective_user
     if not update.message.contact or not update.message.contact.phone_number:
-        await reply_to_update(update, "Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
+        await update.message.reply_text("Не получил номер. Можно отправить телефон кнопкой или написать контакт вручную.")
         return
 
     contact = update.message.contact.phone_number.strip()
@@ -602,14 +573,13 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if last is not None:
         remain = ORDER_COOLDOWN_SEC - int(now - last)
         if remain > 0:
-            await reply_to_update(update, f"⏳ Слишком часто. Повторите через {remain} сек.")
+            await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
             return
 
     oil_id = context.user_data.get("ordering")
     oil = oils.get(oil_id)
     if not oil:
-        await reply_to_update(
-            update,
+        await update.message.reply_text(
             "Товар больше не доступен. Откройте /catalog и выберите заново.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -630,8 +600,7 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     order_id = save_order_sql(order)
 
-    await reply_to_update(
-        update,
+    await update.message.reply_text(
         f"✅ Заявка {order_id} создана!\n"
         f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
         f"Контакт: {contact}\n"
@@ -664,28 +633,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     if "ordering" not in context.user_data:
-        await reply_to_update(update, "Используйте /catalog чтобы выбрать масло.")
+        await update.message.reply_text("Используйте /catalog чтобы выбрать масло.")
         return
 
-    ok, norm_contact = validate_contact(text)
+    ok, norm = validate_contact(text)
     if not ok:
-        await reply_to_update(update, norm_contact)
+        await update.message.reply_text(norm)
         return
-    contact = norm_contact
+    contact = norm
 
     now = time.time()
     last = LAST_ORDER_AT.get(user.id)
     if last is not None:
         remain = ORDER_COOLDOWN_SEC - int(now - last)
         if remain > 0:
-            await reply_to_update(update, f"⏳ Слишком часто. Повторите через {remain} сек.")
+            await update.message.reply_text(f"⏳ Слишком часто. Повторите через {remain} сек.")
             return
 
     oil_id = context.user_data.get("ordering")
     oil = oils.get(oil_id)
     if not oil:
-        await reply_to_update(
-            update,
+        await update.message.reply_text(
             "Товар больше не доступен. Откройте /catalog и выберите заново.",
             reply_markup=ReplyKeyboardRemove(),
         )
@@ -706,8 +674,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     order_id = save_order_sql(order)
 
-    await reply_to_update(
-        update,
+    await update.message.reply_text(
         f"✅ Заявка {order_id} создана!\n"
         f"Товар: {oil['name']} ({oil['volume']}) — {oil.get('price','—')} {oil.get('currency','₽')}\n"
         f"Контакт: {contact}\n"
@@ -734,42 +701,69 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("ordering", None)
 
 
-# ---------- /orders (только админы) ----------
-
+# ---------- /orders (только админы) с пагинацией + кнопки ----------
 async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id not in ADMIN_IDS:
-        await reply_to_update(update, f"⛔ У вас нет доступа. Ваш ID: {update.effective_user.id}")
+    """Работает и как /orders [n] (или /orders_n), и как callback 'orders_page_n'."""
+    # --- проверка админа ---
+    user = update.effective_user
+    if user is None or user.id not in ADMIN_IDS:
+        # Если это колбэк — вежливо отклоняем
+        if update.callback_query:
+            try:
+                await update.callback_query.answer("Недостаточно прав.", show_alert=True)
+            except Exception:
+                pass
+        else:
+            await safe_reply_text(update.message, "⛔ У вас нет доступа.")
         return
 
-    # извлекаем страницу из "/orders N" или "/orders_N"
+    # --- определить страницу ---
     page = 1
-    args = context.args if hasattr(context, "args") else []
-    if args:
+    if update.callback_query:
+        # колбэк вида orders_page_3
+        data = update.callback_query.data or ""
         try:
-            page = int(args[0])
-        except ValueError:
+            page = int(data.rsplit("_", 1)[1])
+        except Exception:
             page = 1
     else:
-        txt = (update.message.text or "").strip()
-        if "_" in txt:
+        # команда: /orders 2 или /orders_2
+        args = context.args if hasattr(context, "args") else []
+        if args:
             try:
-                page = int(txt.split("_", 1)[1])
+                page = int(args[0])
             except ValueError:
                 page = 1
+        else:
+            txt = (update.message.text or "").strip()
+            if "_" in txt:
+                try:
+                    page = int(txt.split("_", 1)[1])
+                except ValueError:
+                    page = 1
 
     page = max(1, page)
     page_size = 10
 
     rows, total = fetch_orders_page(page=page, page_size=page_size)
     if total == 0:
-        await reply_to_update(update, "📭 Заявок пока нет.")
+        # пусто
+        if update.callback_query:
+            await update.callback_query.edit_message_text("📭 Заявок пока нет.")
+        else:
+            await safe_reply_text(update.message, "📭 Заявок пока нет.")
         return
 
     total_pages = (total + page_size - 1) // page_size
     if not rows:
-        await reply_to_update(update, f"Страница {page}/{total_pages} пуста.")
+        text = f"Страница {page}/{total_pages} пуста."
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text)
+        else:
+            await safe_reply_text(update.message, text)
         return
 
+    # --- текст заявок ---
     lines = [f"📋 Список заявок — стр. {page}/{total_pages}\n"]
     for (oid, user_id, username, oil, volume, price, currency, contact, created_at) in rows:
         username_visible = f"@{username}" if username else f"ID:{user_id}"
@@ -780,22 +774,32 @@ async def show_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📞 Контакты: {contact}\n"
             f"🕒 {created_at}\n"
         )
+    text = "\n".join(lines)
 
-    hints = []
+    # --- кнопки пагинации ---
+    buttons = []
     if page > 1:
-        hints.append(f"/orders_{page-1} ← предыдущая")
+        buttons.append(InlineKeyboardButton("⬅️ Предыдущая", callback_data=f"orders_page_{page-1}"))
     if page < total_pages:
-        hints.append(f"/orders_{page+1} → следующая")
+        buttons.append(InlineKeyboardButton("Следующая ➡️", callback_data=f"orders_page_{page+1}"))
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
 
-    msg = "\n".join(lines + (["\n" + " | ".join(hints)] if hints else []))
-    await reply_to_update(update, msg)
+    # --- отправка / редактирование ---
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
+        except Exception:
+            # на случай если редактирование невозможно (например «message is not modified»)
+            await update.callback_query.message.reply_text(text, reply_markup=reply_markup)
+    else:
+        await safe_reply_text(update.message, text, reply_markup=reply_markup)
 
 
 # ---------- ЭКСПОРТЫ (только админы) ----------
-
 async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
     conn = get_conn()
@@ -813,34 +817,31 @@ async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
     if not rows:
-        await reply_to_update(update, "📭 Заявок пока нет.")
+        await update.message.reply_text("📭 Заявок пока нет.")
         return
 
     txt = io.StringIO()
     writer = csv.writer(txt)
-    writer.writerow(["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"])
+    writer.writerow(["id","created_at","user_id","username","oil","volume","price","currency","contact"])
     writer.writerows(rows)
 
-    # UTF-8 BOM, чтобы Excel корректно открыл кириллицу
+    # добавляем UTF-8 BOM, чтобы Excel корректно открыл кириллицу
     bio = io.BytesIO(("\ufeff" + txt.getvalue()).encode("utf-8"))
     bio.seek(0)
 
     filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=bio,
-            filename=filename,
-            caption="Экспорт заявок (CSV)",
-        )
-    except Exception as e:
-        logger.exception("Не удалось отправить файл экспорта CSV: %s", e)
-        await reply_to_update(update, "⚠️ Не удалось отправить CSV. Попробуйте ещё раз позже.")
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        filename=filename,
+        caption="Экспорт заявок (CSV)",
+    )
 
 
 async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await reply_to_update(update, "⛔ Команда доступна только администраторам.")
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Команда доступна только администраторам.")
         return
 
     conn = get_conn()
@@ -858,13 +859,13 @@ async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
 
     if not rows:
-        await reply_to_update(update, "📭 Заявок пока нет.")
+        await update.message.reply_text("📭 Заявок пока нет.")
         return
 
     wb = Workbook()
     ws = wb.active
     ws.title = "orders"
-    headers = ["id", "created_at", "user_id", "username", "oil", "volume", "price", "currency", "contact"]
+    headers = ["id","created_at","user_id","username","oil","volume","price","currency","contact"]
     ws.append(headers)
     for r in rows:
         ws.append(list(r))
@@ -879,23 +880,20 @@ async def export_xlsx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bio.seek(0)
 
     filename = f"orders_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    try:
-        await context.bot.send_document(
-            chat_id=update.effective_chat.id,
-            document=bio,
-            filename=filename,
-            caption="Экспорт заявок (XLSX)",
-        )
-    except Exception as e:
-        logger.exception("Не удалось отправить файл экспорта XLSX: %s", e)
-        await reply_to_update(update, "⚠️ Не удалось отправить XLSX. Попробуйте ещё раз позже.")
+    await context.bot.send_document(
+        chat_id=update.effective_chat.id,
+        document=bio,
+        filename=filename,
+        caption="Экспорт заявок (XLSX)",
+    )
 
 
 # ---------- О нас / Контакты ----------
-
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_to_update(
-        update,
+    # ответить туда, откуда пришёл апдейт (callback или /about)
+    target_msg = update.callback_query.message if update.callback_query else update.message
+    await safe_reply_text(
+        target_msg,
         "🏪 О нас\n\n"
         "Мы занимаемся продажей оригинальных масел для электромобилей и гибридных автомобилей.\n"
         "🔧 Только проверенные бренды.\n\n"
@@ -903,10 +901,11 @@ async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🕘 Время работы: 9:00 — 21:00",
     )
 
-
 async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_to_update(
-        update,
+    # ответить туда, откуда пришёл апдейт (callback или /contacts)
+    target_msg = update.callback_query.message if update.callback_query else update.message
+    await safe_reply_text(
+        target_msg,
         "📞 Наши контакты:\n\n"
         "Телефон: +7 (999) 559-39-17 - Андрей, +7 (953) 046-36-54 - Влад\n"
         "Telegram: @shaba_v, @andrey_matveev\n"
@@ -914,61 +913,28 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ---------- CANCEL / UNKNOWN ----------
-
+# ---------- CANCEL ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет оформление заявки и убирает клавиатуру."""
     if "ordering" in context.user_data:
         context.user_data.pop("ordering", None)
-        await reply_to_update(
-            update,
+        await update.message.reply_text(
             "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
             reply_markup=ReplyKeyboardRemove(),
         )
     else:
-        await reply_to_update(
-            update,
+        await update.message.reply_text(
             "Нечего отменять. Напишите /catalog чтобы открыть каталог.",
             reply_markup=ReplyKeyboardRemove(),
         )
 
 
+# ---------- UNKNOWN COMMAND ----------
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await reply_to_update(update, "Я не знаю эту команду. Попробуйте /start или /catalog.")
-
-
-# ---------- Меню команд (красота) ----------
-
-async def set_bot_commands(app: Application):
-    # для всех
-    try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "стартовое сообщение"),
-            BotCommand("catalog", "открыть каталог"),
-            BotCommand("about", "о компании"),
-            BotCommand("contacts", "контакты"),
-            BotCommand("find", "поиск по каталогу"),
-            BotCommand("cancel", "отменить оформление"),
-        ], scope=BotCommandScopeDefault())
-    except Exception as e:
-        logger.warning("Не удалось установить общие команды: %s", e)
-
-    # для админов — персональные команды в их чатах
-    for admin_id in ADMIN_IDS:
-        try:
-            await app.bot.set_my_commands([
-                BotCommand("orders", "заявки (/orders 2 — страница 2)"),
-                BotCommand("exportcsv", "выгрузка заявок (CSV)"),
-                BotCommand("exportxlsx", "выгрузка заявок (XLSX)"),
-                BotCommand("stats", "статистика"),
-                BotCommand("version", "версия бота"),
-            ], scope=BotCommandScopeChat(chat_id=admin_id))
-        except Exception as e:
-            logger.warning("Не удалось задать команды для админа %s: %s", admin_id, e)
+    await update.message.reply_text("Я не знаю эту команду. Попробуйте /start или /catalog.")
 
 
 # ---------- Главная ----------
-
 def main():
     # подготовим БД + миграция
     init_db()
@@ -988,11 +954,8 @@ def main():
 
     app = Application.builder().token(TOKEN).request(request).build()
 
-    # После инициализации — задать меню команд
-    app.post_init = set_bot_commands
-
     # фильтр "только админам"
-    admin_filter = F.User(user_id=ADMIN_IDS)
+    admin_filter = tg_filters.User(user_id=ADMIN_IDS)
 
     # --- Команды ---
     app.add_handler(CommandHandler("find", find_oil))
@@ -1004,7 +967,7 @@ def main():
 
     # Админские
     app.add_handler(CommandHandler("orders", show_orders, filters=admin_filter))
-    app.add_handler(MessageHandler(F.Regex(r"^/orders_\d+$") & admin_filter, show_orders))
+    app.add_handler(MessageHandler(tg_filters.Regex(r"^/orders_\d+$") & admin_filter, show_orders))
     app.add_handler(CommandHandler("exportcsv", export_csv, filters=admin_filter))
     app.add_handler(CommandHandler("exportxcsv", export_csv, filters=admin_filter))  # алиас
     app.add_handler(CommandHandler("exportxlsx", export_xlsx, filters=admin_filter))
@@ -1012,19 +975,20 @@ def main():
     app.add_handler(CommandHandler("version", version_cmd, filters=admin_filter))
 
     # --- Кнопки (callback) ---
-    # Стартовое меню: ловим все четыре кнопки
     app.add_handler(CallbackQueryHandler(
         handle_start_button,
         pattern=r"^(open_catalog|open_search_hint|open_about|open_contacts)$"
     ))
+    # Пагинация заявок (кнопки «Назад/Вперёд»)
+    app.add_handler(CallbackQueryHandler(show_orders, pattern=r"^orders_page_\d+$"))
     # Карточки каталога: back | order_<id> | <id>
     app.add_handler(CallbackQueryHandler(show_oil, pattern=r"^(back|order_\d+|\d+)$"))
 
     # --- Сообщения ---
-    app.add_handler(MessageHandler(F.CONTACT, handle_contact))
-    app.add_handler(MessageHandler(F.TEXT & ~F.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.CONTACT, handle_contact))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     # Unknown command — в самом конце
-    app.add_handler(MessageHandler(F.COMMAND, unknown_command))
+    app.add_handler(MessageHandler(filters.COMMAND, unknown_command))
 
     # --- Ошибки ---
     app.add_error_handler(error_handler)
