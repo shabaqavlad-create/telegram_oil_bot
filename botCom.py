@@ -42,8 +42,6 @@ if not TOKEN:
 
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
-if not ADMIN_IDS:
-    logger.warning("ADMIN_IDS пуст — админские команды будут недоступны никому.")
 
 # --- Пути к данным ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -67,6 +65,9 @@ logger.addHandler(file_handler)
 logger.setLevel(logging.INFO)
 
 logger.propagate = False
+
+if not ADMIN_IDS:
+    logger.warning("ADMIN_IDS пуст — админские команды будут недоступны никому.")
 # --- Антиспам ---
 ORDER_COOLDOWN_SEC = 20
 LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней УСПЕШНОЙ заявки

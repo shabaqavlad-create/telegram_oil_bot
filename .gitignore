@@ -23,3 +23,8 @@ exports/
 
 # dotenv
 .env
+
+catalog_overrides.json
+
+bot.log
+bot.log.*
