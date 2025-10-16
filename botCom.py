@@ -34,13 +34,6 @@ from openpyxl import Workbook
 
 from catalog import oils  # dict: id -> {name, volume, description, features, compatible, price, currency, image}
 
-# --- Логирование ---
-logging.basicConfig(
-    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
-
 # --- Настройка токена и админов ---
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
@@ -49,12 +42,31 @@ if not TOKEN:
 
 ADMIN_IDS = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [int(x.strip()) for x in ADMIN_IDS.split(",") if x.strip().isdigit()]
+if not ADMIN_IDS:
+    logger.warning("ADMIN_IDS пуст — админские команды будут недоступны никому.")
 
 # --- Пути к данным ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ORDERS_FILE = os.path.join(BASE_DIR, "orders.json")
 DB_PATH = os.path.join(BASE_DIR, "orders.db")
 
+from logging.handlers import RotatingFileHandler
+
+# --- Логирование ---
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+LOG_PATH = os.path.join(BASE_DIR, "bot.log")
+file_handler = RotatingFileHandler(LOG_PATH, maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+file_handler.setLevel(logging.INFO)
+
+logger.addHandler(file_handler)
+logger.setLevel(logging.INFO)
+
+logger.propagate = False
 # --- Антиспам ---
 ORDER_COOLDOWN_SEC = 20
 LAST_ORDER_AT: dict[int, float] = {}  # user_id -> ts последней УСПЕШНОЙ заявки
@@ -312,6 +324,11 @@ def get_effective_oil(oil_id: int) -> dict | None:
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# async def _post_init(app: Application):
+#     try:
+#         await set_bot_commands(app)
+#     except Exception as e:
+#         logger.warning("Не удалось установить список команд в меню: %s", e)
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Exception while handling update:", exc_info=context.error)
@@ -352,6 +369,35 @@ async def show_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, seconds:
         import asyncio
         await asyncio.sleep(seconds)
 
+async def pingdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    try:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM orders")
+        total = c.fetchone()[0] or 0
+        size = os.path.getsize(DB_PATH) if os.path.exists(DB_PATH) else 0
+        await update.message.reply_text(f"✅ DB OK\norders: {total}\nsize: {size/1024:.1f} KB")
+    except Exception as e:
+        await update.message.reply_text(f"❌ DB error: {e}")
+    finally:
+        try: conn.close()
+        except: pass
+
+async def backupdb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dst = os.path.join(BASE_DIR, f"orders_backup_{ts}.db")
+    try:
+        src = sqlite3.connect(DB_PATH)
+        dst_conn = sqlite3.connect(dst)
+        src.backup(dst_conn)
+        dst_conn.close(); src.close()
+        await context.bot.send_document(chat_id=update.effective_chat.id, document=open(dst, "rb"), filename=os.path.basename(dst), caption="Бэкап БД")
+    except Exception as e:
+        await update.message.reply_text(f"Не удалось сделать бэкап: {e}")
 
 # ---------- СТАТИСТИКА ----------
 def fetch_stats():
@@ -475,29 +521,32 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     uid = update.effective_user.id
     is_admin_user = uid in ADMIN_IDS
+    data = query.data
 
-    if query.data == "open_catalog":
+    # ✅ Единый гард для всех admin_* кнопок
+    if data.startswith("admin_") and not is_admin_user:
+        await query.answer("Только для админов", show_alert=True)
+        return
+
+    if data == "open_catalog":
         await show_typing(context, query.message.chat.id, 0.5)
         await show_catalog(update, context)
 
-    elif query.data == "open_search_hint":
+    elif data == "open_search_hint":
         await query.message.reply_text("Введите запрос командой:\n/find castrol 1 л")
 
-    elif query.data == "open_about":
+    elif data == "open_about":
         await about(update, context)
 
-    elif query.data == "open_contacts":
+    elif data == "open_contacts":
         await contacts(update, context)
 
-    elif query.data == "noop":
+    elif data == "noop":
         await query.answer("Нет в наличии", show_alert=False)
 
     # ---------- АДМИН-КНОПКИ ----------
-    elif query.data == "admin_setprice_help":
-        if not is_admin_user:
-            await query.answer("Только для админов", show_alert=True)
-            return
-        # небольшая подсказка + топ-10 ID для удобства
+    elif data == "admin_setprice_help":
+        # тут локальная проверка больше не нужна
         ids_preview = "\n".join([f"{oid}: {oil['name']}" for oid, oil in list(oils.items())[:10]])
         await query.message.reply_text(
             "✏️ Как изменить цену:\n"
@@ -509,10 +558,7 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Первые позиции (id:name):\n" + (ids_preview if ids_preview else "—")
         )
 
-    elif query.data == "admin_setstock_help":
-        if not is_admin_user:
-            await query.answer("Только для админов", show_alert=True)
-            return
+    elif data == "admin_setstock_help":
         ids_preview = "\n".join([f"{oid}: {oil['name']}" for oid, oil in list(oils.items())[:10]])
         await query.message.reply_text(
             "📦 Как изменить остаток:\n"
@@ -524,13 +570,8 @@ async def handle_start_button(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Первые позиции (id:name):\n" + (ids_preview if ids_preview else "—")
         )
 
-    elif query.data == "admin_stock_summary":
-        if not is_admin_user:
-            await query.answer("Только для админов", show_alert=True)
-            return
-        # просто вызываем сводку, но убедимся, что она умеет отвечать в callback-чате
+    elif data == "admin_stock_summary":
         await stock_cmd(update, context)
-
 
 # --- Поиск по каталогу ---
 def _norm(s: str) -> str:
@@ -589,9 +630,9 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await show_typing(context, update.effective_chat.id, 0.6)
 
     keyboard = [
-        [InlineKeyboardButton(f"{oil['name']} ({oil['volume']})", callback_data=str(oil_id))]
-        for oil_id, oil in oils.items()
-    ]
+    [InlineKeyboardButton(f"{oils[i]['name']} ({oils[i]['volume']})", callback_data=str(i))]
+    for i in sorted(oils.keys())
+]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     if update.callback_query:
@@ -691,17 +732,34 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
         buttons.append([InlineKeyboardButton("📞 Связаться", url="https://t.me/shaba_v")])
         reply_markup = InlineKeyboardMarkup(buttons)
 
+        # удаляем старое сообщение (если можно)
         try:
             await query.delete_message()
         except Exception:
             pass
 
-        await query.message.reply_photo(
-            photo=eff["image"],
-            caption=caption,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-        )
+        photo = eff.get("image")
+        try:
+            if photo:
+                await query.message.reply_photo(
+                    photo=photo,
+                    caption=caption,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+            else:
+                await query.message.reply_text(
+                    caption,
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                )
+        except Exception:
+            # если отправка фото не удалась — покажем карточку текстом
+            await query.message.reply_text(
+                caption,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
 
 
 # ---------- ОБЩИЙ ХЕЛПЕР ОФОРМЛЕНИЯ ЗАЯВКИ ----------
@@ -1183,7 +1241,8 @@ def main():
     app.add_handler(CommandHandler("setprice", setprice_cmd, filters=admin_filter))
     app.add_handler(CommandHandler("setstock", setstock_cmd, filters=admin_filter))
     app.add_handler(CommandHandler("stock", stock_cmd, filters=admin_filter))
-
+    app.add_handler(CommandHandler("pingdb", pingdb, filters=admin_filter))
+    app.add_handler(CommandHandler("backupdb", backupdb, filters=admin_filter))
     # --- Кнопки (callback) ---
     app.add_handler(CallbackQueryHandler(
         handle_start_button,
@@ -1201,7 +1260,7 @@ def main():
     app.add_error_handler(error_handler)
 
     logger.info("Бот запущен... 🚀")
-
+    
     # Запуск
     app.run_polling(
         timeout=60,
