@@ -474,7 +474,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Я бот-магазин масел для электромобилей и гибридов.\n\n"
         "🛠 Используйте кнопки ниже, чтобы открыть каталог, узнать о компании или связаться с нами.\n\n"
         "📌 Дополнительно:\n"
-        "/cancel — отменить оформление заявки\n"
         "/start — показать это сообщение"
     )
 
@@ -488,7 +487,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/version — текущая версия\n"
             "/setprice — изменить цену\n"
             "/setstock — изменить остаток\n"
-            "/stock — сводка остатков"
+            "/stock — сводка остатков\n"
+            "/pingdb — Проверка БД\n"
+            "/backupdb — Бэкап БД"
         )
 
     keyboard = [
@@ -632,7 +633,7 @@ async def show_catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = [
     [InlineKeyboardButton(f"{oils[i]['name']} ({oils[i]['volume']})", callback_data=str(i))]
-    for i in sorted(oils.keys())
+    for i in sorted(oils.keys(), key=int) # ← вот тут добавляем key=int
 ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -683,11 +684,9 @@ async def show_oil(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🛒 Вы выбрали:\n"
             f"{eff['name']} ({eff['volume']}) — {eff.get('price', 'цена не указана')} {eff.get('currency', '₽')}\n\n"
             "Отправьте ваш телефон одной кнопкой (рекомендуется) или введите контакт вручную.\n"
-            "Можно отменить командой /cancel"
         )
         kb = [
             [KeyboardButton("📱 Отправить телефон", request_contact=True)],
-            [KeyboardButton("Отмена /cancel")],
         ]
         await query.message.reply_text(
             text,
@@ -851,7 +850,12 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Путь 2: пользователь ввёл контакт текстом."""
+    # Если оформление не начато — не дергать валидатор контактов.
+    if "ordering" not in context.user_data:
+        await update.message.reply_text("Чтобы оформить заявку, откройте каталог: /catalog")
+        return
+
+    # Пользователь в процессе оформления: ждём контакт
     ok, norm = validate_contact(update.message.text)
     if not ok:
         await update.message.reply_text(norm)
@@ -1062,22 +1066,6 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
     )
 
-
-# ---------- CANCEL ----------
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "ordering" in context.user_data:
-        context.user_data.pop("ordering", None)
-        await update.message.reply_text(
-            "❌ Оформление заявки отменено. Напишите /catalog чтобы выбрать масло снова.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    else:
-        await update.message.reply_text(
-            "Нечего отменять. Напишите /catalog чтобы открыть каталог.",
-            reply_markup=ReplyKeyboardRemove(),
-        )
-
-
 # ---------- UNKNOWN COMMAND ----------
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Я не знаю эту команду. Попробуйте /start или откройте каталог кнопкой.")
@@ -1164,7 +1152,6 @@ async def set_bot_commands(application):
         BotCommand("find", "Поиск по каталогу"),
         BotCommand("about", "О компании"),
         BotCommand("contacts", "Контакты"),
-        BotCommand("cancel", "Отменить оформление заявки"),
     ]
 
     admin_only = [
@@ -1176,6 +1163,8 @@ async def set_bot_commands(application):
         BotCommand("setprice", "Изменить цену"),
         BotCommand("setstock", "Изменить остаток"),
         BotCommand("stock", "Сводка остатков"),
+        BotCommand("pingdb", "Проверка БД"),       
+        BotCommand("backupdb", "Бэкап БД"),        
     ]
 
     # 1) Команды по умолчанию — увидят все в любом чате
@@ -1229,7 +1218,6 @@ def main():
     app.add_handler(CommandHandler("catalog", show_catalog))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("contacts", contacts))
-    app.add_handler(CommandHandler("cancel", cancel))
 
     # --- Команды (админские) ---
     app.add_handler(CommandHandler("orders", show_orders, filters=admin_filter))
