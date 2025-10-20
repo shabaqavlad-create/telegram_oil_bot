@@ -9,7 +9,7 @@ oils = {
         "description": "Оригинальное трансмиссионное масло BYD для гибридных и электрических автомобилей.",
         "features": [
             "Обеспечивает надежную работу редуктора и трансмиссии",
-            "Разработано специально для силовых установок BYD",
+            "Разработано специально для силовых установок BYD и других авто",
             "Высокая устойчивость к нагрузкам и температурным перепадам"
         ],
         "compatible": "Подходит для моделей BYD с редукторами EHSF-1 и EHSF-2LV",
@@ -111,6 +111,6 @@ oils = {
             "Высокая устойчивость к нагрузкам и температурным перепадам"
         ],
         "compatible": "Подходит для моделей BYD с редукторами EHSF-1 и EHSF-2LV",
-        "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/refs/heads/main/images/IMG_20250919_114827_931.jpg"
+        "image": "https://raw.githubusercontent.com/shabaqavlad-create/telegram_oil_bot/c49a15dcc8beef8593d0ad6b257cb56223b6d6a5/images/IMG_0648.JPG"
     },
 }
