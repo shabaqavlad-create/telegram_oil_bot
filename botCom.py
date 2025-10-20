@@ -1061,9 +1061,9 @@ async def contacts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_reply_text(
         target_msg,
         "📞 Наши контакты:\n\n"
-        "Телефон: +7 (999) 559-39-17 — Андрей, +7 (953) 046-36-54 — Влад\n"
-        "Telegram: @shaba_v, @andrey_matveev\n"
-        "Авито: https://m.avito.ru/brands/2c07f021e144d3169204cd556d312cdf/items/all",
+        "Телефон: +7 (999) 559-39-17 — Андрей\n +7 (953) 046-36-54 — Влад\n"
+        "Telegram: @shaba_v - Влад\n @andrey_matveev - Андрей\n"
+        "Авито: https://www.avito.ru/brands/8b21f97207fefb16d53943372cbf21b0",
     )
 
 # ---------- UNKNOWN COMMAND ----------
